@@ -22,6 +22,8 @@ roles:
         - assign_tasks
         - summarize_status
         - request_approval
+        - review_delivery_plan
+        - review_qa_verdict
       cannot:
         - approve_own_work
         - push_code

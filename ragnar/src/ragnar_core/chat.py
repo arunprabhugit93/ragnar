@@ -9,6 +9,7 @@ from typing import Any
 from .approval_store import ApprovalStore, default_approvals_path
 from .config import default_config_path
 from .orchestrator import run_objective
+from .role_runtime import RoleRuntimeMode
 
 
 def _repo_root() -> Path:
@@ -92,6 +93,7 @@ class ChatSession:
         prepare_worktrees: bool,
         record_runs: bool,
         show_json: bool = False,
+        role_runtime_mode: RoleRuntimeMode = "offline",
     ) -> None:
         self.roles_path = roles_path
         self.config_path = config_path
@@ -100,6 +102,7 @@ class ChatSession:
         self.prepare_worktrees = prepare_worktrees
         self.record_runs = record_runs
         self.show_json = show_json
+        self.role_runtime_mode = role_runtime_mode
         self.last_objective: str | None = None
         self.last_run_id: str | None = None
         self.approvals = ApprovalStore(default_approvals_path(_repo_root()))
@@ -116,6 +119,7 @@ class ChatSession:
             record_runs=self.record_runs,
             prepare_worktrees=self.prepare_worktrees,
             config_path=self.config_path,
+            role_runtime_mode=self.role_runtime_mode,
         )
         self.last_run_id = str(state["run_id"])
         return render_state(state, self.show_json)
@@ -186,6 +190,12 @@ def main() -> None:
     parser.add_argument("--no-record-runs", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--once", help="Run one objective and exit.")
+    parser.add_argument(
+        "--role-runtime",
+        choices=["offline", "letta"],
+        default="letta",
+        help="offline: no LLM calls, stub packets only. letta: call each role's provisioned Letta agent.",
+    )
     args = parser.parse_args()
 
     session = ChatSession(
@@ -196,6 +206,7 @@ def main() -> None:
         prepare_worktrees=not args.no_worktrees,
         record_runs=not args.no_record_runs,
         show_json=args.json,
+        role_runtime_mode=args.role_runtime,
     )
 
     if args.once:

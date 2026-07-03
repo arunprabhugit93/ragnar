@@ -1,16 +1,58 @@
 from __future__ import annotations
 
+import json
 import sys
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from ragnar_core.chat import ChatSession, render_state
 from ragnar_core.config import load_config
 from ragnar_core.edit_adapter import SafePatchAdapter, extract_changed_files
-from ragnar_core.orchestrator import run_objective
+from ragnar_core.orchestrator import MAX_PLAN_REVISIONS, RagnarOrchestrator, run_objective
 from ragnar_core.pr_adapter import build_pr_draft
+from ragnar_core.role_registry import load_role_registry
+from ragnar_core.role_runtime import RoleRuntimeResult
 from ragnar_core.workspace import RoleWorkspaceManager
+
+
+class _ScriptedRoleRuntime:
+    """Test double: scripted raw_reply sequences for specific (role_id, action) pairs,
+    offline-stub behavior (raw_reply=None) for everything else."""
+
+    def __init__(self, scripted: dict[tuple[str, str], list[str]]) -> None:
+        self.scripted = scripted
+        self._call_counts: dict[tuple[str, str], int] = {}
+
+    def run(self, role: Any, objective: str, action: str, context_hits: list[dict[str, Any]], invocation: Any = None) -> RoleRuntimeResult:
+        used_context_hits = sum(len(item.get("hits", [])) for item in context_hits)
+        key = (role.role_id, action)
+        replies = self.scripted.get(key)
+        if replies:
+            index = self._call_counts.get(key, 0)
+            self._call_counts[key] = index + 1
+            reply = replies[min(index, len(replies) - 1)]
+            return RoleRuntimeResult(
+                role_id=role.role_id,
+                runtime="scripted_test_double",
+                letta_agent_id="test-agent",
+                memory_namespace=role.private_memory_namespace,
+                message="scripted reply for test",
+                used_context_hits=used_context_hits,
+                status="provider_responded",
+                raw_reply=reply,
+            )
+        return RoleRuntimeResult(
+            role_id=role.role_id,
+            runtime="letta_manifest_stub",
+            letta_agent_id=None,
+            memory_namespace=role.private_memory_namespace,
+            message="offline stub for test",
+            used_context_hits=used_context_hits,
+            status="no_real_letta_agent_manifest",
+            raw_reply=None,
+        )
 
 
 def test_orchestrator_routes_all_build_roles() -> None:
@@ -168,7 +210,8 @@ def test_config_and_pr_draft_shapes() -> None:
         ],
     )
 
-    assert model.provider == "local"
+    assert model.provider == "openrouter"
+    assert model.model.startswith("openrouter/")
     assert draft.status == "draft_only"
     assert draft.source_branches == ["ragnar/run-1/backend_engineer"]
     assert draft.changed_files == ["src/service/users.py"]
@@ -195,3 +238,99 @@ def test_chat_render_json_mode() -> None:
     rendered = render_state({"run_id": "run-1", "phase": "done", "selected_build_roles": []}, show_json=True)
 
     assert '"run_id": "run-1"' in rendered
+
+
+def test_architect_plan_produces_real_agent_artifact_shape_offline() -> None:
+    state = run_objective("fix the login bug", checkpoint_db=None)
+    plan_artifact = next(a for a in state["artifacts"] if a["kind"] == "architecture_plan")
+
+    assert plan_artifact["owner_role"] == "delivery_architect"
+    assert plan_artifact["body"]["agent_invocation"]["role_id"] == "delivery_architect"
+    assert plan_artifact["body"]["agent_result"]["status"] == "no_provider"
+
+
+def test_conductor_review_plan_defaults_to_approve_offline() -> None:
+    state = run_objective("fix the login bug", checkpoint_db=None)
+
+    assert state["plan_review_verdict"] == "approve"
+    assert state["plan_revision_count"] == 0
+    artifact_kinds = [a["kind"] for a in state["artifacts"]]
+    assert "conductor_plan_review" in artifact_kinds
+    assert "backend_work_packet" in artifact_kinds
+
+
+def test_conductor_review_qa_defaults_to_approve_offline() -> None:
+    state = run_objective("fix the login bug", checkpoint_db=None)
+
+    assert state["qa_review_verdict"] == "approve"
+    assert state["qa_rework_roles"] == []
+    artifact_kinds = [a["kind"] for a in state["artifacts"]]
+    assert "conductor_qa_review" in artifact_kinds
+    assert "integration_packet" in artifact_kinds
+
+
+def test_plan_revision_loop_respects_retry_cap() -> None:
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    orchestrator = RagnarOrchestrator(
+        registry,
+        config_path=Path("ragnar/ragnar.yaml"),
+        prepare_worktrees=False,
+        record_runs=False,
+    )
+    orchestrator.role_runtime = _ScriptedRoleRuntime(
+        {
+            ("conductor", "review_delivery_plan"): [
+                '{"verdict":"revise","feedback":"needs more detail","rework_roles":[]}',
+            ],
+        }
+    )
+
+    state = orchestrator.invoke("fix the login bug")
+
+    assert state["plan_revision_count"] == MAX_PLAN_REVISIONS
+    assert state["plan_review_verdict"] == "escalated_to_owner"
+    plan_artifacts = [a for a in state["artifacts"] if a["kind"] == "architecture_plan"]
+    assert len(plan_artifacts) == MAX_PLAN_REVISIONS + 1
+    assert state.get("final_report")
+
+
+def test_qa_revision_loop_routes_back_to_named_role() -> None:
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    orchestrator = RagnarOrchestrator(
+        registry,
+        config_path=Path("ragnar/ragnar.yaml"),
+        prepare_worktrees=False,
+        record_runs=False,
+    )
+    orchestrator.role_runtime = _ScriptedRoleRuntime(
+        {
+            ("conductor", "review_qa_verdict"): [
+                '{"verdict":"revise","feedback":"fix the auth check","rework_roles":["backend_engineer"]}',
+                '{"verdict":"approve","feedback":"looks good","rework_roles":[]}',
+            ],
+        }
+    )
+
+    state = orchestrator.invoke("fix the login bug")
+
+    backend_packets = [a for a in state["artifacts"] if a["kind"] == "backend_work_packet"]
+    assert len(backend_packets) == 2
+    assert backend_packets[1]["body"]["agent_invocation"]["rework_feedback"] == "fix the auth check"
+    assert state["qa_review_verdict"] == "approve"
+
+
+def test_final_report_includes_owner_briefing_offline() -> None:
+    state = run_objective("fix the login bug", checkpoint_db=None)
+
+    assert isinstance(state.get("owner_briefing"), str) and state["owner_briefing"]
+    parsed = json.loads(state["final_report"])
+    assert parsed["run_id"] == state["run_id"]
+    assert set(parsed.keys()) == {
+        "run_id",
+        "objective",
+        "phase",
+        "selected_build_roles",
+        "artifact_count",
+        "blocked",
+        "approval_requests",
+    }

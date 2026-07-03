@@ -1,4 +1,163 @@
 {
-  "agents": {},
+  "agents": {
+    "backend_engineer": {
+      "display_name": "Backend",
+      "letta_agent_id": "agent-f897cf6a-41ff-41f3-9cb5-5aac29413dcc",
+      "model": "openrouter/deepseek/deepseek-chat",
+      "private_memory_namespace": "roles/backend_engineer",
+      "role_id": "backend_engineer",
+      "tags": [
+        "ragnar",
+        "role:backend_engineer",
+        "team:build",
+        "memory:roles/backend_engineer"
+      ]
+    },
+    "conductor": {
+      "display_name": "Ragnar",
+      "letta_agent_id": "agent-cda3af7e-732f-4a4e-a793-0b2fd42f20b1",
+      "model": "openrouter/anthropic/claude-haiku-4.5",
+      "private_memory_namespace": "roles/conductor",
+      "role_id": "conductor",
+      "tags": [
+        "ragnar",
+        "role:conductor",
+        "team:conductor",
+        "memory:roles/conductor"
+      ]
+    },
+    "correspondence_drafter": {
+      "display_name": "Postman",
+      "letta_agent_id": "agent-c676f006-7a06-41c3-b39d-0a0f45ede4db",
+      "model": "openrouter/anthropic/claude-haiku-4.5",
+      "private_memory_namespace": "roles/correspondence_drafter",
+      "role_id": "correspondence_drafter",
+      "tags": [
+        "ragnar",
+        "role:correspondence_drafter",
+        "team:watch",
+        "memory:roles/correspondence_drafter"
+      ]
+    },
+    "delivery_architect": {
+      "display_name": "Architect",
+      "letta_agent_id": "agent-a975468c-9f51-4b94-8626-2bbe9639911f",
+      "model": "openrouter/anthropic/claude-sonnet-4.5",
+      "private_memory_namespace": "roles/delivery_architect",
+      "role_id": "delivery_architect",
+      "tags": [
+        "ragnar",
+        "role:delivery_architect",
+        "team:build",
+        "memory:roles/delivery_architect"
+      ]
+    },
+    "frontend_engineer": {
+      "display_name": "Frontend",
+      "letta_agent_id": "agent-6e99325f-9c07-4aa4-9a2d-c0e1c032cdb1",
+      "model": "openrouter/moonshotai/kimi-k2",
+      "private_memory_namespace": "roles/frontend_engineer",
+      "role_id": "frontend_engineer",
+      "tags": [
+        "ragnar",
+        "role:frontend_engineer",
+        "team:build",
+        "memory:roles/frontend_engineer"
+      ]
+    },
+    "integrator": {
+      "display_name": "Forge",
+      "letta_agent_id": "agent-606eadc1-8679-43b3-a553-84503980a273",
+      "model": "openrouter/openai/gpt-4.1-mini",
+      "private_memory_namespace": "roles/integrator",
+      "role_id": "integrator",
+      "tags": [
+        "ragnar",
+        "role:integrator",
+        "team:build",
+        "memory:roles/integrator"
+      ]
+    },
+    "live_ops_monitor": {
+      "display_name": "Sentinel",
+      "letta_agent_id": "agent-ef870363-0018-4eb5-96fe-e5fd40c06e93",
+      "model": "openrouter/anthropic/claude-haiku-4.5",
+      "private_memory_namespace": "roles/live_ops_monitor",
+      "role_id": "live_ops_monitor",
+      "tags": [
+        "ragnar",
+        "role:live_ops_monitor",
+        "team:watch",
+        "memory:roles/live_ops_monitor"
+      ]
+    },
+    "portfolio_editor": {
+      "display_name": "Scribe",
+      "letta_agent_id": "agent-8cb650b4-1062-4269-be28-cf50413c4082",
+      "model": "openrouter/anthropic/claude-haiku-4.5",
+      "private_memory_namespace": "roles/portfolio_editor",
+      "role_id": "portfolio_editor",
+      "tags": [
+        "ragnar",
+        "role:portfolio_editor",
+        "team:watch",
+        "memory:roles/portfolio_editor"
+      ]
+    },
+    "project_registrar": {
+      "display_name": "Curator",
+      "letta_agent_id": "agent-1074501c-d633-4a27-9198-0d63055be1c4",
+      "model": "openrouter/anthropic/claude-haiku-4.5",
+      "private_memory_namespace": "roles/project_registrar",
+      "role_id": "project_registrar",
+      "tags": [
+        "ragnar",
+        "role:project_registrar",
+        "team:watch",
+        "memory:roles/project_registrar"
+      ]
+    },
+    "qa_engineer": {
+      "display_name": "QA",
+      "letta_agent_id": "agent-89cc666a-1c6f-4a27-9981-ba84226d8b6d",
+      "model": "openrouter/openai/gpt-4.1-mini",
+      "private_memory_namespace": "roles/qa_engineer",
+      "role_id": "qa_engineer",
+      "tags": [
+        "ragnar",
+        "role:qa_engineer",
+        "team:build",
+        "memory:roles/qa_engineer"
+      ]
+    },
+    "researcher": {
+      "display_name": "Scout",
+      "letta_agent_id": "agent-ba244968-9a12-440e-a0a9-67578a8063c4",
+      "model": "openrouter/anthropic/claude-haiku-4.5",
+      "private_memory_namespace": "roles/researcher",
+      "role_id": "researcher",
+      "tags": [
+        "ragnar",
+        "role:researcher",
+        "team:watch",
+        "memory:roles/researcher"
+      ]
+    },
+    "workflow_engineer": {
+      "display_name": "Flow",
+      "letta_agent_id": "agent-f3c3ffa7-fdb0-41df-b13c-6e4ab5e8d216",
+      "model": "openrouter/google/gemini-2.5-flash",
+      "private_memory_namespace": "roles/workflow_engineer",
+      "role_id": "workflow_engineer",
+      "tags": [
+        "ragnar",
+        "role:workflow_engineer",
+        "team:build",
+        "memory:roles/workflow_engineer"
+      ]
+    }
+  },
+  "base_url": "http://localhost:8283",
+  "embedding": "letta/letta-free",
   "system": "ragnar"
 }

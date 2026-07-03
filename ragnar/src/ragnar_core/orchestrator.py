@@ -13,19 +13,31 @@ from typing import Annotated, Any, Literal, TypedDict
 from .approval_store import ApprovalStore, default_approvals_path
 from .approval_broker import ApprovalBroker, Decision
 from .config import RagnarConfig, default_config_path, load_config
-from .contracts import build_invocation_contract, provider_free_result
+from .contracts import (
+    agent_result_from_reply,
+    build_invocation_contract,
+    expected_review_output_schema,
+    provider_free_result,
+    review_result_from_reply,
+    RoleReviewResult,
+    SCHEMA_VERSION,
+)
 from .context_memory import ContextMemoryProvider, MemoryMode
+from .edit_adapter import SafePatchAdapter
 from .execution import LocalExecutionAdapter
 from .memory_writeback import MemoryWritebackStore, default_writeback_path
 from .observability import RunRecorder, default_runs_path
 from .pr_adapter import PullRequestDraftStore, build_pr_draft, default_pr_draft_dir
-from .role_runtime import RoleRuntime, default_manifest_path
+from .role_runtime import RoleRuntime, RoleRuntimeMode, default_manifest_path, extract_json_object
 from .role_registry import RoleContract, RoleRegistry, load_role_registry
-from .workspace import RoleWorkspaceManager, policies_as_dict
+from .workspace import RoleWorkspaceManager
 
 
 BuildRole = Literal["backend_engineer", "frontend_engineer", "workflow_engineer"]
 BUILD_SEQUENCE: tuple[BuildRole, ...] = ("backend_engineer", "frontend_engineer", "workflow_engineer")
+
+MAX_PLAN_REVISIONS = 2
+MAX_QA_REVISIONS = 2
 
 
 class RagnarState(TypedDict, total=False):
@@ -44,6 +56,14 @@ class RagnarState(TypedDict, total=False):
     approval_requests: Annotated[list[dict[str, Any]], operator.add]
     blocked: bool
     final_report: str
+    plan_review_verdict: str
+    plan_review_feedback: str
+    plan_revision_count: int
+    qa_review_verdict: str
+    qa_review_feedback: str
+    qa_rework_roles: list[str]
+    qa_revision_count: int
+    owner_briefing: str
 
 
 def _repo_root() -> Path:
@@ -105,6 +125,7 @@ class RagnarOrchestrator:
         config_path: Path | None = None,
         record_runs: bool = True,
         prepare_worktrees: bool = True,
+        role_runtime_mode: RoleRuntimeMode = "offline",
     ) -> None:
         self.registry = registry
         self.approval_broker = ApprovalBroker()
@@ -113,7 +134,13 @@ class RagnarOrchestrator:
         self.memory_provider = ContextMemoryProvider(mode=memory_mode)
         self.execution = LocalExecutionAdapter(repo_root)
         self.workspaces = RoleWorkspaceManager(repo_root, enabled=prepare_worktrees)
-        self.role_runtime = RoleRuntime(manifest_path or default_manifest_path(repo_root))
+        self.patch_adapter = SafePatchAdapter(self.workspaces)
+        self.role_runtime = RoleRuntime(
+            manifest_path or default_manifest_path(repo_root),
+            mode=role_runtime_mode,
+            base_url=os.environ.get("LETTA_SERVER_URL", "http://localhost:8283"),
+            api_key=os.environ.get("LETTA_API_KEY"),
+        )
         self.approval_store = ApprovalStore(approvals_path or default_approvals_path(repo_root))
         self.memory_writebacks = MemoryWritebackStore(default_writeback_path(repo_root))
         self.pr_drafts = PullRequestDraftStore(default_pr_draft_dir(repo_root))
@@ -132,11 +159,13 @@ class RagnarOrchestrator:
         graph.add_node("intake_objective", self.intake_objective)
         graph.add_node("conductor_triage", self.conductor_triage)
         graph.add_node("architect_plan", self.architect_plan)
+        graph.add_node("conductor_review_plan", self.conductor_review_plan)
         graph.add_node("dispatch_build_roles", self.dispatch_build_roles)
         graph.add_node("backend_engineer", self.backend_engineer)
         graph.add_node("frontend_engineer", self.frontend_engineer)
         graph.add_node("workflow_engineer", self.workflow_engineer)
         graph.add_node("qa_gate", self.qa_gate)
+        graph.add_node("conductor_review_qa", self.conductor_review_qa)
         graph.add_node("integrator_prepare", self.integrator_prepare)
         graph.add_node("approval_gate", self.approval_gate)
         graph.add_node("final_report", self.final_report)
@@ -144,7 +173,12 @@ class RagnarOrchestrator:
         graph.add_edge(START, "intake_objective")
         graph.add_edge("intake_objective", "conductor_triage")
         graph.add_edge("conductor_triage", "architect_plan")
-        graph.add_edge("architect_plan", "dispatch_build_roles")
+        graph.add_edge("architect_plan", "conductor_review_plan")
+        graph.add_conditional_edges(
+            "conductor_review_plan",
+            self.after_plan_review,
+            {"architect_plan": "architect_plan", "dispatch_build_roles": "dispatch_build_roles"},
+        )
         graph.add_conditional_edges(
             "dispatch_build_roles",
             self.next_build_node,
@@ -166,7 +200,18 @@ class RagnarOrchestrator:
             {"workflow_engineer": "workflow_engineer", "qa_gate": "qa_gate"},
         )
         graph.add_edge("workflow_engineer", "qa_gate")
-        graph.add_edge("qa_gate", "integrator_prepare")
+        graph.add_edge("qa_gate", "conductor_review_qa")
+        graph.add_conditional_edges(
+            "conductor_review_qa",
+            self.after_qa_review,
+            {
+                "backend_engineer": "backend_engineer",
+                "frontend_engineer": "frontend_engineer",
+                "workflow_engineer": "workflow_engineer",
+                "dispatch_build_roles": "dispatch_build_roles",
+                "integrator_prepare": "integrator_prepare",
+            },
+        )
         graph.add_edge("integrator_prepare", "approval_gate")
         graph.add_edge("approval_gate", "final_report")
         graph.add_edge("final_report", END)
@@ -258,41 +303,46 @@ class RagnarOrchestrator:
         }
 
     def architect_plan(self, state: RagnarState) -> dict[str, Any]:
-        architect = self.registry.get("delivery_architect")
-        plan_steps = [
-            "Confirm objective and acceptance criteria.",
-            "Retrieve role-private and shared context before execution.",
-            "Prepare isolated role worktrees when Git is available.",
-            "Perform role-scoped implementation work only in selected build roles.",
-            "Enforce file-scope and command allowlist policy before execution.",
-            "Run QA gate before integration.",
-            "Request owner approval for outward actions.",
-        ]
-        return {
-            "phase": "planned",
-            "artifacts": [
-                _artifact(
-                    "architecture_plan",
-                    architect.role_id,
-                    {
-                        "objective": state["objective"],
-                        "selected_build_roles": state.get("selected_build_roles", []),
-                        "plan_steps": plan_steps,
-                        "acceptance_criteria": [
-                            "Every role action must be allowed by its role contract.",
-                            "Every selected build role must receive an isolated workspace report.",
-                            "Role diffs must stay inside the role file-scope policy.",
-                            "Local commands must match the role command allowlist.",
-                            "No outward action may be executed without approval.",
-                            "QA must produce a verdict before integration.",
-                            "Integrator may prepare artifacts but cannot merge or deploy.",
-                        ],
-                        "workspace_policy": policies_as_dict(),
-                        "agent_contract_schema": "ragnar-contract/v1",
-                    },
-                )
+        revision_count = state.get("plan_revision_count", 0)
+        feedback = state.get("plan_review_feedback") if revision_count > 0 else None
+        return self._role_execution_artifact(
+            role_id="delivery_architect",
+            action="create_delivery_plan",
+            state=state,
+            output_kind="architecture_plan",
+            notes=[
+                "Decompose the objective into scoped, ordered tasks with acceptance criteria.",
+                "Every role action must be allowed by its role contract.",
+                "Role diffs must stay inside each role's file-scope policy.",
+                "No outward action may be executed without owner approval.",
+                "Plan only -- do not implement.",
             ],
-            "audit_events": [_event("architect_plan", "created strict execution plan")],
+            rework_feedback=feedback,
+        )
+
+    def conductor_review_plan(self, state: RagnarState) -> dict[str, Any]:
+        plan_artifact = self._latest_artifact(state, "architecture_plan")
+        result = self._conductor_review(
+            review_kind="plan_review",
+            action="review_delivery_plan",
+            state=state,
+            subject_artifact=plan_artifact,
+            revision_count_key="plan_revision_count",
+            max_revisions=MAX_PLAN_REVISIONS,
+            review_instructions=[
+                "Review the architect's delivery plan for completeness and fit to the objective.",
+                "verdict='revise' sends it back to the architect with your feedback; "
+                "verdict='approve' proceeds to the build roles.",
+            ],
+        )
+        return {
+            "phase": "plan_reviewed",
+            "plan_review_verdict": result["verdict"],
+            "plan_review_feedback": result["feedback"],
+            "plan_revision_count": result["revision_count"],
+            "artifacts": [result["artifact"]],
+            "proposed_actions": result["proposed_actions"],
+            "audit_events": [result["audit_event"]],
         }
 
     def dispatch_build_roles(self, state: RagnarState) -> dict[str, Any]:
@@ -301,6 +351,11 @@ class RagnarOrchestrator:
             "phase": "dispatched",
             "audit_events": [_event("dispatch_build_roles", "dispatching bounded role nodes", roles=selected)],
         }
+
+    def _rework_feedback_for(self, state: RagnarState, role_id: str) -> str | None:
+        if role_id in state.get("qa_rework_roles", []):
+            return state.get("qa_review_feedback")
+        return None
 
     def backend_engineer(self, state: RagnarState) -> dict[str, Any]:
         return self._role_execution_artifact(
@@ -312,6 +367,7 @@ class RagnarOrchestrator:
                 "Inspect services, APIs, data models, migrations, and pipelines.",
                 "Keep production data mutation out of scope without owner approval.",
             ],
+            rework_feedback=self._rework_feedback_for(state, "backend_engineer"),
         )
 
     def frontend_engineer(self, state: RagnarState) -> dict[str, Any]:
@@ -324,6 +380,7 @@ class RagnarOrchestrator:
                 "Inspect UI components, pages, client state, styling, and user-facing flows.",
                 "Keep public branding changes behind owner approval.",
             ],
+            rework_feedback=self._rework_feedback_for(state, "frontend_engineer"),
         )
 
     def workflow_engineer(self, state: RagnarState) -> dict[str, Any]:
@@ -336,6 +393,7 @@ class RagnarOrchestrator:
                 "Inspect workflow configs, automation, webhooks, and system wiring.",
                 "Do not enable external webhooks or production workflows without owner approval.",
             ],
+            rework_feedback=self._rework_feedback_for(state, "workflow_engineer"),
         )
 
     def qa_gate(self, state: RagnarState) -> dict[str, Any]:
@@ -362,6 +420,53 @@ class RagnarOrchestrator:
         warnings = []
         if not command_results:
             warnings.append("No real QA command was configured for this run.")
+
+        # The deterministic verdict above is ground truth from real exit codes and stays
+        # authoritative. This adds a narrative reasoning layer on top of it -- QA's agent
+        # cannot override "fail" into "pass", it can only comment on/explain the result.
+        role_context = self._role_memory_context(state, qa)
+        policy = self.workspaces.policies.get("qa_engineer")
+        workspace_report = self.workspaces.prepare(state["run_id"], "qa_engineer")
+        observed_facts = {
+            "verdict": verdict,
+            "reviewed_artifacts": [artifact["kind"] for artifact in build_packets],
+            "commands": command_results,
+            "denied_commands": denied_commands,
+            "warnings": warnings,
+        }
+        invocation = build_invocation_contract(
+            run_id=state["run_id"],
+            objective=state["objective"],
+            action="produce_qa_verdict",
+            role=qa,
+            model=self.config.role_model("qa_engineer"),
+            workspace=workspace_report.to_dict(),
+            policy=policy,
+            memory_context=role_context
+            + [{"scope": "observed_facts", "namespace": None, "query": {}, "hits": [observed_facts], "errors": []}],
+        )
+        runtime_result = self.role_runtime.run(
+            qa, state["objective"], "produce_qa_verdict", role_context, invocation=invocation
+        )
+        if runtime_result.raw_reply is not None:
+            agent_result = agent_result_from_reply(state["run_id"], qa, "qa_verdict", runtime_result.raw_reply)
+        else:
+            agent_result = provider_free_result(
+                state["run_id"], qa, "qa_verdict", f"Provider-free QA reasoning; deterministic verdict is {verdict}."
+            )
+
+        if self.record_runs:
+            self.memory_writebacks.append_many(agent_result.memory_writebacks)
+
+        proposed_actions = []
+        rejected_actions = []
+        for item in agent_result.proposed_actions:
+            item_decision = self.approval_broker.decide(qa, item["action"])
+            if item_decision.decision is Decision.DENY:
+                rejected_actions.append({**item, "broker_reason": item_decision.reason})
+                continue
+            proposed_actions.append({"role_id": item["role_id"], "action": item["action"], "reason": item["reason"]})
+
         return {
             "phase": "qa_complete",
             "artifacts": [
@@ -374,10 +479,48 @@ class RagnarOrchestrator:
                         "commands": command_results,
                         "denied_commands": denied_commands,
                         "warnings": warnings,
+                        "agent_invocation": invocation.to_dict(),
+                        "agent_result": agent_result.to_dict(),
+                        "rejected_actions": rejected_actions,
                     },
                 )
             ],
+            "proposed_actions": proposed_actions,
             "audit_events": [_event("qa_gate", "produced QA verdict", verdict=verdict)],
+        }
+
+    def conductor_review_qa(self, state: RagnarState) -> dict[str, Any]:
+        qa_artifact = self._latest_artifact(state, "qa_verdict")
+        result = self._conductor_review(
+            review_kind="qa_review",
+            action="review_qa_verdict",
+            state=state,
+            subject_artifact=qa_artifact,
+            revision_count_key="qa_revision_count",
+            max_revisions=MAX_QA_REVISIONS,
+            review_instructions=[
+                "Review the QA verdict and the build work packets it reviewed.",
+                "verdict='revise' sends work back to the build role(s) named in rework_roles; "
+                "verdict='approve' proceeds to integration.",
+                "Name specific build role_ids in rework_roles (backend_engineer, frontend_engineer, "
+                "workflow_engineer) when you know which one needs rework; leave it empty only if "
+                "the whole build phase needs to be redone.",
+            ],
+        )
+        rework_roles = result["rework_roles"]
+        if result["verdict"] == "revise" and not rework_roles:
+            # Ambiguous rework target -- fall back to redoing every currently selected build role
+            # rather than guessing, by routing through dispatch_build_roles' existing fan-out.
+            rework_roles = list(state.get("selected_build_roles", []))
+        return {
+            "phase": "qa_reviewed",
+            "qa_review_verdict": result["verdict"],
+            "qa_review_feedback": result["feedback"],
+            "qa_rework_roles": rework_roles,
+            "qa_revision_count": result["revision_count"],
+            "artifacts": [result["artifact"]],
+            "proposed_actions": result["proposed_actions"],
+            "audit_events": [result["audit_event"]],
         }
 
     def integrator_prepare(self, state: RagnarState) -> dict[str, Any]:
@@ -469,8 +612,77 @@ class RagnarOrchestrator:
         }
         return {
             "final_report": json.dumps(report, indent=2),
+            "owner_briefing": self._conductor_synthesize_briefing(state, report),
             "audit_events": [_event("final_report", "created final orchestration report")],
         }
+
+    def _conductor_synthesize_briefing(self, state: RagnarState, report: dict[str, Any]) -> str:
+        conductor = self.registry.get("conductor")
+        decision = self.approval_broker.decide(conductor, "summarize_status")
+        if decision.decision is Decision.DENY:
+            raise RuntimeError(f"conductor cannot summarize_status: {decision.reason}")
+
+        policy = self.workspaces.policies.get("conductor")
+        workspace_report = self.workspaces.prepare(state["run_id"], "conductor")
+        memory_context = [
+            {
+                "scope": "run_summary",
+                "namespace": None,
+                "query": {},
+                "hits": [
+                    {
+                        "structured_report": report,
+                        "plan_review": {
+                            "verdict": state.get("plan_review_verdict"),
+                            "feedback": state.get("plan_review_feedback"),
+                        },
+                        "qa_review": {
+                            "verdict": state.get("qa_review_verdict"),
+                            "feedback": state.get("qa_review_feedback"),
+                            "rework_roles": state.get("qa_rework_roles", []),
+                        },
+                    }
+                ],
+                "errors": [],
+            }
+        ]
+        invocation = build_invocation_contract(
+            run_id=state["run_id"],
+            objective=state["objective"],
+            action="summarize_status",
+            role=conductor,
+            model=self.config.role_model("conductor"),
+            workspace=workspace_report.to_dict(),
+            policy=policy,
+            memory_context=memory_context,
+            expected_output_schema={
+                "schema_version": SCHEMA_VERSION,
+                "required_fields": ["briefing"],
+                "rules": [
+                    "Return JSON only, a single object with one field: briefing.",
+                    "briefing is a short, natural-language, decision-first summary for the human owner: "
+                    "what happened, what (if anything) needs their decision, and any risks flagged during review.",
+                ],
+            },
+        )
+        runtime_result = self.role_runtime.run(
+            conductor, state["objective"], "summarize_status", memory_context, invocation=invocation
+        )
+        if runtime_result.raw_reply is not None:
+            try:
+                payload = json.loads(extract_json_object(runtime_result.raw_reply))
+                briefing = str(payload.get("briefing", "")).strip()
+                if briefing:
+                    return briefing
+            except (json.JSONDecodeError, ValueError, AttributeError):
+                pass
+
+        status_line = "Awaiting your approval." if report["blocked"] else "No approvals pending."
+        roles_line = ", ".join(report["selected_build_roles"]) or "no build roles"
+        return (
+            f"Run {report['run_id']}: {report['phase']}. "
+            f"{report['artifact_count']} artifacts produced across {roles_line}. {status_line}"
+        )
 
     def next_build_node(self, state: RagnarState) -> str:
         selected = set(state.get("selected_build_roles", []))
@@ -492,6 +704,20 @@ class RagnarOrchestrator:
         if "workflow_engineer" in selected:
             return "workflow_engineer"
         return "qa_gate"
+
+    def after_plan_review(self, state: RagnarState) -> str:
+        if state.get("plan_review_verdict") == "revise":
+            return "architect_plan"
+        return "dispatch_build_roles"
+
+    def after_qa_review(self, state: RagnarState) -> str:
+        verdict = state.get("qa_review_verdict")
+        if verdict in ("approve", "escalated_to_owner"):
+            return "integrator_prepare"
+        rework_roles = state.get("qa_rework_roles", [])
+        if len(rework_roles) == 1 and rework_roles[0] in BUILD_SEQUENCE:
+            return rework_roles[0]
+        return "dispatch_build_roles"
 
     def _select_build_roles(self, objective: str) -> list[str]:
         normalized = objective.lower().replace("-", "_").replace("/", " ")
@@ -577,16 +803,16 @@ class RagnarOrchestrator:
         state: RagnarState,
         output_kind: str,
         notes: list[str],
+        rework_feedback: str | None = None,
     ) -> dict[str, Any]:
         role = self.registry.get(role_id)
         decision = self.approval_broker.decide(role, action)
         if decision.decision is Decision.DENY:
             raise RuntimeError(f"{role_id} cannot run {action}: {decision.reason}")
         role_context = self._role_memory_context(state, role)
-        runtime_result = self.role_runtime.run(role, state["objective"], action, role_context)
         workspace_report = self.workspaces.prepare(state["run_id"], role_id)
         diff_report = self.workspaces.diff(state["run_id"], role_id) if workspace_report.available else None
-        policy = self.workspaces.policies[role_id]
+        policy = self.workspaces.policies.get(role_id)
         invocation = build_invocation_contract(
             run_id=state["run_id"],
             objective=state["objective"],
@@ -596,15 +822,51 @@ class RagnarOrchestrator:
             workspace=workspace_report.to_dict(),
             policy=policy,
             memory_context=role_context,
+            rework_feedback=rework_feedback,
         )
-        agent_result = provider_free_result(
-            state["run_id"],
-            role,
-            output_kind,
-            f"Provider-free bounded packet for {role_id}; no edits proposed.",
-        )
+        runtime_result = self.role_runtime.run(role, state["objective"], action, role_context, invocation=invocation)
+        if runtime_result.raw_reply is not None:
+            agent_result = agent_result_from_reply(state["run_id"], role, output_kind, runtime_result.raw_reply)
+        else:
+            agent_result = provider_free_result(
+                state["run_id"],
+                role,
+                output_kind,
+                f"Provider-free bounded packet for {role_id}; no edits proposed.",
+            )
+
+        patch_reports: list[dict[str, Any]] = []
+        if agent_result.proposed_patches and workspace_report.available and workspace_report.worktree_path:
+            if self.config.allow_agent_edits():
+                for patch in agent_result.proposed_patches:
+                    report = self.patch_adapter.apply(role_id, Path(workspace_report.worktree_path), patch.unified_diff)
+                    patch_reports.append({"patch_id": patch.patch_id, **report.to_dict()})
+            else:
+                patch_reports = [
+                    {
+                        "patch_id": patch.patch_id,
+                        "applied": False,
+                        "reason": "execution.allow_agent_edits is false in ragnar.yaml",
+                    }
+                    for patch in agent_result.proposed_patches
+                ]
+
         if self.record_runs:
             self.memory_writebacks.append_many(agent_result.memory_writebacks)
+
+        # A model can hallucinate an action name the role has no grant for at all --
+        # approval_gate() raises on outright DENY, so filter those out here instead
+        # of letting untrusted model output crash the run. Anything requiring
+        # approval or already allowed still reaches the real approval gate.
+        proposed_actions = []
+        rejected_actions = []
+        for item in agent_result.proposed_actions:
+            item_decision = self.approval_broker.decide(role, item["action"])
+            if item_decision.decision is Decision.DENY:
+                rejected_actions.append({**item, "broker_reason": item_decision.reason})
+                continue
+            proposed_actions.append({"role_id": item["role_id"], "action": item["action"], "reason": item["reason"]})
+
         return {
             "phase": f"{role_id}_complete",
             "artifacts": [
@@ -630,10 +892,13 @@ class RagnarOrchestrator:
                         "agent_result": agent_result.to_dict(),
                         "handoffs": [handoff.to_dict() for handoff in agent_result.handoffs],
                         "memory_writebacks": [writeback.to_dict() for writeback in agent_result.memory_writebacks],
+                        "patch_reports": patch_reports,
+                        "rejected_actions": rejected_actions,
                         "notes": notes,
                     },
                 )
             ],
+            "proposed_actions": proposed_actions,
             "audit_events": [_event(role_id, "completed bounded role node", action=action)],
         }
 
@@ -647,6 +912,107 @@ class RagnarOrchestrator:
                 role_context.append(item)
         return role_context
 
+    def _latest_artifact(self, state: RagnarState, kind: str) -> dict[str, Any] | None:
+        return next((artifact for artifact in reversed(state.get("artifacts", [])) if artifact["kind"] == kind), None)
+
+    def _conductor_review(
+        self,
+        review_kind: str,
+        action: str,
+        state: RagnarState,
+        subject_artifact: dict[str, Any] | None,
+        revision_count_key: str,
+        max_revisions: int,
+        review_instructions: list[str],
+    ) -> dict[str, Any]:
+        conductor = self.registry.get("conductor")
+        decision = self.approval_broker.decide(conductor, action)
+        if decision.decision is Decision.DENY:
+            raise RuntimeError(f"conductor cannot run {action}: {decision.reason}")
+
+        policy = self.workspaces.policies.get("conductor")
+        workspace_report = self.workspaces.prepare(state["run_id"], "conductor")
+        memory_context = [
+            {
+                "scope": "review_subject",
+                "namespace": None,
+                "query": {"kind": review_kind, "instructions": review_instructions},
+                "hits": [subject_artifact] if subject_artifact else [],
+                "errors": [] if subject_artifact else [f"No {review_kind} subject artifact found."],
+            }
+        ]
+        invocation = build_invocation_contract(
+            run_id=state["run_id"],
+            objective=state["objective"],
+            action=action,
+            role=conductor,
+            model=self.config.role_model("conductor"),
+            workspace=workspace_report.to_dict(),
+            policy=policy,
+            memory_context=memory_context,
+            expected_output_schema=expected_review_output_schema(),
+        )
+        runtime_result = self.role_runtime.run(
+            conductor, state["objective"], action, memory_context, invocation=invocation
+        )
+        if runtime_result.raw_reply is not None:
+            review = review_result_from_reply(state["run_id"], conductor, runtime_result.raw_reply)
+        else:
+            review = RoleReviewResult(
+                schema_version=SCHEMA_VERSION,
+                run_id=state["run_id"],
+                role_id=conductor.role_id,
+                verdict="approve",
+                feedback="Offline mode: auto-approved.",
+                rework_roles=[],
+            )
+
+        revision_count = state.get(revision_count_key, 0)
+        verdict = review.verdict
+        if verdict == "revise":
+            if revision_count >= max_revisions:
+                verdict = "escalated_to_owner"
+            else:
+                revision_count += 1
+
+        proposed_actions: list[dict[str, Any]] = []
+        if verdict == "escalated_to_owner":
+            proposed_actions.append(
+                {
+                    "role_id": conductor.role_id,
+                    "action": "request_approval",
+                    "reason": f"{review_kind} revision cap reached; proceeding under owner review flag.",
+                }
+            )
+
+        artifact = _artifact(
+            f"conductor_{review_kind}",
+            conductor.role_id,
+            {
+                "objective": state["objective"],
+                "reviewed_artifact_kind": subject_artifact["kind"] if subject_artifact else None,
+                "verdict": verdict,
+                "model_verdict": review.verdict,
+                "feedback": review.feedback,
+                "rework_roles": review.rework_roles,
+                "revision_count": revision_count,
+                "role_runtime": runtime_result.to_dict(),
+                "agent_invocation": invocation.to_dict(),
+                "review_instructions": review_instructions,
+            },
+        )
+        audit_event = _event(f"conductor_{review_kind}", "conductor reviewed artifact", verdict=verdict)
+
+        return {
+            "verdict": verdict,
+            "feedback": review.feedback,
+            "rework_roles": review.rework_roles,
+            "revision_count": revision_count,
+            "artifact": artifact,
+            "audit_event": audit_event,
+            "proposed_actions": proposed_actions,
+        }
+
 
 def run_objective(
     objective: str,
@@ -658,6 +1024,7 @@ def run_objective(
     record_runs: bool = False,
     prepare_worktrees: bool = False,
     config_path: Path | None = None,
+    role_runtime_mode: RoleRuntimeMode = "offline",
 ) -> RagnarState:
     registry = load_role_registry(roles_path or _default_roles_path())
     orchestrator = RagnarOrchestrator(
@@ -667,6 +1034,7 @@ def run_objective(
         record_runs=record_runs,
         prepare_worktrees=prepare_worktrees,
         config_path=config_path,
+        role_runtime_mode=role_runtime_mode,
     )
     return orchestrator.invoke(objective, checkpoint_db=checkpoint_db, run_id=run_id)
 
@@ -693,6 +1061,12 @@ def main() -> None:
     parser.add_argument("--no-checkpoint", action="store_true", help="Use in-memory checkpoints for this run.")
     parser.add_argument("--no-record-runs", action="store_true", help="Do not write .ragnar/runs observability files.")
     parser.add_argument("--no-worktrees", action="store_true", help="Do not prepare isolated role Git worktrees.")
+    parser.add_argument(
+        "--role-runtime",
+        choices=["offline", "letta"],
+        default="letta",
+        help="offline: no LLM calls, stub packets only. letta: call each role's provisioned Letta agent.",
+    )
     parser.add_argument("--json", action="store_true", help="Print the full graph state as JSON.")
     args = parser.parse_args()
 
@@ -707,6 +1081,7 @@ def main() -> None:
         record_runs=not args.no_record_runs,
         prepare_worktrees=not args.no_worktrees,
         config_path=args.config,
+        role_runtime_mode=args.role_runtime,
     )
     if args.json:
         print(json.dumps(state, indent=2, default=str))

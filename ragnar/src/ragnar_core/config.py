@@ -39,6 +39,12 @@ class RagnarConfig:
     def memory_mode(self) -> str:
         return str(self.raw.get("memory", {}).get("mode", "auto"))
 
+    def embedding_model(self) -> str:
+        return str(self.raw.get("models", {}).get("embedding", "letta/letta-free"))
+
+    def allow_agent_edits(self) -> bool:
+        return bool(self.raw.get("execution", {}).get("allow_agent_edits", False))
+
     def to_dict(self) -> dict[str, Any]:
         return self.raw
 

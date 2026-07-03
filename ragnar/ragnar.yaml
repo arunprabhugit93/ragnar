@@ -1,53 +1,60 @@
 version: 0.1
 
 providers:
-  default: local
+  default: openrouter
   allowed:
     - local
     - openai
     - anthropic
     - openrouter
 
+# Model strings use Letta's provider handle format: "<letta_provider>/<upstream>/<model>".
+# Every role below is routed through the single OpenRouter key in vendor/letta/.env,
+# but each role can point at a different upstream vendor (Anthropic, DeepSeek, Moonshot
+# Kimi, Google, OpenAI) purely by changing this string -- no extra keys needed per vendor.
 models:
+  # Free, keyless embedding hosted by Letta itself -- used for every role's
+  # Letta agent regardless of which chat-completion vendor that role uses.
+  embedding: letta/letta-free
   default:
-    provider: local
-    model: provider-not-configured
+    provider: openrouter
+    model: openrouter/anthropic/claude-haiku-4.5
     temperature: 0.1
     max_tokens: 4096
   roles:
     conductor:
-      provider: local
-      model: provider-not-configured
+      provider: openrouter
+      model: openrouter/anthropic/claude-haiku-4.5
       temperature: 0.1
       max_tokens: 4096
     delivery_architect:
-      provider: local
-      model: provider-not-configured
+      provider: openrouter
+      model: openrouter/anthropic/claude-sonnet-4.5
       temperature: 0.1
       max_tokens: 4096
     backend_engineer:
-      provider: local
-      model: provider-not-configured
+      provider: openrouter
+      model: openrouter/deepseek/deepseek-chat
       temperature: 0.1
       max_tokens: 4096
     frontend_engineer:
-      provider: local
-      model: provider-not-configured
+      provider: openrouter
+      model: openrouter/moonshotai/kimi-k2
       temperature: 0.1
       max_tokens: 4096
     workflow_engineer:
-      provider: local
-      model: provider-not-configured
+      provider: openrouter
+      model: openrouter/google/gemini-2.5-flash
       temperature: 0.1
       max_tokens: 4096
     qa_engineer:
-      provider: local
-      model: provider-not-configured
+      provider: openrouter
+      model: openrouter/openai/gpt-4.1-mini
       temperature: 0.0
       max_tokens: 4096
     integrator:
-      provider: local
-      model: provider-not-configured
+      provider: openrouter
+      model: openrouter/openai/gpt-4.1-mini
       temperature: 0.0
       max_tokens: 4096
 
@@ -60,7 +67,10 @@ memory:
 execution:
   prepare_worktrees: true
   require_policy_clean_diff: true
-  allow_agent_edits: false
+  # Gate for whether a role's proposed_patches actually get applied via
+  # SafePatchAdapter (still checked against the role's file-scope policy
+  # regardless of this flag). Set false to review patches without writing them.
+  allow_agent_edits: true
 
 pull_requests:
   mode: draft_only

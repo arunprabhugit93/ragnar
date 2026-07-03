@@ -8,11 +8,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from .config import RagnarConfig, default_config_path, load_config
 from .role_registry import RoleContract, load_role_registry
 
 
-DEFAULT_MODEL = "openai/gpt-4o-mini"
-DEFAULT_EMBEDDING = "openai/text-embedding-3-small"
+DEFAULT_MODEL = "letta/letta-free"
+DEFAULT_EMBEDDING = "letta/letta-free"
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,7 @@ class ProvisionedAgent:
     letta_agent_id: str
     private_memory_namespace: str
     tags: list[str]
+    model: str
 
 
 def _repo_root() -> Path:
@@ -167,10 +169,26 @@ def create_or_reuse_agents(
     embedding: str,
     communication_tools: bool = True,
     dry_run: bool = False,
+    config: RagnarConfig | None = None,
 ) -> list[ProvisionedAgent]:
+    """Provision one durable Letta agent per role.
+
+    When `config` is given, each role's model comes from ragnar.yaml's
+    per-role provider/model (already a Letta handle like
+    "openrouter/anthropic/claude-haiku-4.5") instead of one fixed model
+    for every role. `model`/`embedding` remain the fallback when a role
+    has no config entry.
+    """
     registry = load_role_registry(roles_path)
     manifest = _load_manifest(manifest_path)
     agents_manifest = manifest.setdefault("agents", {})
+
+    def model_for(role_id: str) -> str:
+        if config is None:
+            return model
+        return config.role_model(role_id).model
+
+    embedding_for_run = config.embedding_model() if config is not None else embedding
 
     if dry_run:
         return [
@@ -180,6 +198,7 @@ def create_or_reuse_agents(
                 letta_agent_id=agents_manifest.get(role.role_id, {}).get("letta_agent_id", "<dry-run>"),
                 private_memory_namespace=role.private_memory_namespace,
                 tags=_tags(role),
+                model=model_for(role.role_id),
             )
             for role in registry.all()
         ]
@@ -197,6 +216,7 @@ def create_or_reuse_agents(
                     letta_agent_id=existing["letta_agent_id"],
                     private_memory_namespace=role.private_memory_namespace,
                     tags=existing.get("tags", _tags(role)),
+                    model=existing.get("model", model_for(role.role_id)),
                 )
             )
             continue
@@ -206,8 +226,8 @@ def create_or_reuse_agents(
             "name": f"ragnar__{role.role_id}",
             "memory_blocks": _memory_blocks(role),
             "tags": _tags(role),
-            "model": model,
-            "embedding": embedding,
+            "model": model_for(role.role_id),
+            "embedding": embedding_for_run,
             "metadata": {
                 "system": "ragnar",
                 "role_id": role.role_id,
@@ -234,14 +254,14 @@ def create_or_reuse_agents(
             letta_agent_id=agent_id,
             private_memory_namespace=role.private_memory_namespace,
             tags=_tags(role),
+            model=model_for(role.role_id),
         )
         agents_manifest[role.role_id] = asdict(record)
         provisioned.append(record)
         _save_manifest(manifest_path, manifest)
 
     manifest["base_url"] = base_url
-    manifest["model"] = model
-    manifest["embedding"] = embedding
+    manifest["embedding"] = embedding_for_run
     _save_manifest(manifest_path, manifest)
     return provisioned
 
@@ -250,10 +270,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Provision durable Letta agents for Ragnar roles")
     parser.add_argument("--roles", type=Path, default=_default_roles_path())
     parser.add_argument("--manifest", type=Path, default=_default_manifest_path())
+    parser.add_argument("--config", type=Path, default=default_config_path())
     parser.add_argument("--base-url", default=os.getenv("LETTA_SERVER_URL", "http://localhost:8283"))
     parser.add_argument("--api-key", default=os.getenv("LETTA_API_KEY"))
     parser.add_argument("--model", default=os.getenv("RAGNAR_LETTA_MODEL", DEFAULT_MODEL))
     parser.add_argument("--embedding", default=os.getenv("RAGNAR_LETTA_EMBEDDING", DEFAULT_EMBEDDING))
+    parser.add_argument(
+        "--no-config",
+        action="store_true",
+        help="Ignore ragnar.yaml per-role models; use --model/--embedding for every role.",
+    )
     parser.add_argument(
         "--no-communication-tools",
         action="store_true",
@@ -261,6 +287,8 @@ def main() -> None:
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+
+    config = None if args.no_config else load_config(args.config)
 
     try:
         records = create_or_reuse_agents(
@@ -272,6 +300,7 @@ def main() -> None:
             embedding=args.embedding,
             communication_tools=not args.no_communication_tools,
             dry_run=args.dry_run,
+            config=config,
         )
     except Exception as exc:
         if "Connection error" in str(exc) or "Connection refused" in repr(exc):
@@ -282,7 +311,7 @@ def main() -> None:
     for record in records:
         print(
             f"{record.role_id:24s} {record.display_name:12s} "
-            f"letta_id={record.letta_agent_id} memory={record.private_memory_namespace}"
+            f"letta_id={record.letta_agent_id} model={record.model} memory={record.private_memory_namespace}"
         )
 
 

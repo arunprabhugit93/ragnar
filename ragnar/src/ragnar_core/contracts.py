@@ -72,6 +72,7 @@ class RoleInvocationContract:
     memory_context: list[dict[str, Any]]
     handoff_inputs: list[dict[str, Any]]
     expected_output_schema: dict[str, Any]
+    rework_feedback: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -96,6 +97,19 @@ class RoleAgentResult:
             "handoffs": [handoff.to_dict() for handoff in self.handoffs],
             "memory_writebacks": [writeback.to_dict() for writeback in self.memory_writebacks],
         }
+
+
+@dataclass(frozen=True)
+class RoleReviewResult:
+    schema_version: str
+    run_id: str
+    role_id: str
+    verdict: Literal["approve", "revise"]
+    feedback: str
+    rework_roles: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 def role_contract_dict(role: RoleContract) -> dict[str, Any]:
@@ -135,6 +149,23 @@ def expected_role_output_schema() -> dict[str, Any]:
     }
 
 
+def expected_review_output_schema() -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "required_fields": ["run_id", "role_id", "verdict", "feedback", "rework_roles"],
+        "verdict_values": ["approve", "revise"],
+        "rules": [
+            "Return JSON only.",
+            "verdict must be exactly 'approve' or 'revise'; never invent other values.",
+            "feedback must be actionable and specific enough for the reviewed role to act on.",
+            "rework_roles is only meaningful when verdict is 'revise' for a QA review; "
+            "list the build role_ids (backend_engineer, frontend_engineer, workflow_engineer) "
+            "that need to redo work. Leave empty for plan reviews or when the whole plan is fine.",
+            "Never claim to have performed the reviewed role's work yourself.",
+        ],
+    }
+
+
 def build_invocation_contract(
     run_id: str,
     objective: str,
@@ -142,9 +173,11 @@ def build_invocation_contract(
     role: RoleContract,
     model: ModelConfig,
     workspace: dict[str, Any],
-    policy: RoleWorkspacePolicy,
+    policy: RoleWorkspacePolicy | None,
     memory_context: list[dict[str, Any]],
     handoff_inputs: list[dict[str, Any]] | None = None,
+    rework_feedback: str | None = None,
+    expected_output_schema: dict[str, Any] | None = None,
 ) -> RoleInvocationContract:
     return RoleInvocationContract(
         schema_version=SCHEMA_VERSION,
@@ -155,21 +188,22 @@ def build_invocation_contract(
         model=model.to_dict(),
         role_contract=role_contract_dict(role),
         workspace=workspace,
-        file_policy={"allowed_path_globs": policy.allowed_path_globs},
-        command_policy={"allowed_command_families": policy.allowed_command_families},
+        file_policy={"allowed_path_globs": policy.allowed_path_globs if policy else []},
+        command_policy={"allowed_command_families": policy.allowed_command_families if policy else []},
         memory_context=memory_context,
         handoff_inputs=handoff_inputs or [],
-        expected_output_schema=expected_role_output_schema(),
+        expected_output_schema=expected_output_schema or expected_role_output_schema(),
+        rework_feedback=rework_feedback,
     )
 
 
-def provider_free_result(
-    run_id: str,
-    role: RoleContract,
-    artifact_kind: str,
-    summary: str,
-) -> RoleAgentResult:
-    handoffs = [
+def _deterministic_handoffs(role: RoleContract, artifact_kind: str, summary: str) -> list[HandoffArtifact]:
+    """Handoff routing always comes from the role contract, never from model output.
+
+    The policy broker outside the LLM owns routing; a model reply can supply
+    summary text but must not be able to redirect who receives a handoff.
+    """
+    return [
         HandoffArtifact(
             from_role=role.role_id,
             to_role=target,
@@ -180,6 +214,14 @@ def provider_free_result(
         )
         for target in role.handoffs.get("sends_to", [])
     ]
+
+
+def provider_free_result(
+    run_id: str,
+    role: RoleContract,
+    artifact_kind: str,
+    summary: str,
+) -> RoleAgentResult:
     writebacks = [
         MemoryWriteback(
             role_id=role.role_id,
@@ -198,9 +240,154 @@ def provider_free_result(
         status="no_provider",
         summary=summary,
         proposed_patches=[],
-        handoffs=handoffs,
+        handoffs=_deterministic_handoffs(role, artifact_kind, summary),
         memory_writebacks=writebacks,
         proposed_actions=[],
+    )
+
+
+def agent_result_from_reply(
+    run_id: str,
+    role: RoleContract,
+    artifact_kind: str,
+    reply_text: str,
+) -> RoleAgentResult:
+    """Parse a live provider reply into a RoleAgentResult.
+
+    Never trusts the model's own claim that an outward action already
+    happened -- proposed_actions still flow through the same ApprovalBroker
+    as everything else. A malformed reply degrades to status="failed"
+    rather than raising, so one bad model response can't crash the run.
+    """
+    from .role_runtime import extract_json_object
+
+    try:
+        payload = json.loads(extract_json_object(reply_text))
+        if not isinstance(payload, dict):
+            raise ValueError("reply JSON is not an object")
+    except (json.JSONDecodeError, ValueError):
+        return RoleAgentResult(
+            schema_version=SCHEMA_VERSION,
+            run_id=run_id,
+            role_id=role.role_id,
+            status="failed",
+            summary=f"Provider reply for {role.role_id} was not valid JSON.",
+            proposed_patches=[],
+            handoffs=_deterministic_handoffs(role, artifact_kind, "Provider reply was not valid JSON."),
+            memory_writebacks=[],
+            proposed_actions=[],
+        )
+
+    status = str(payload.get("status", "failed"))
+    if status not in {"proposed", "completed", "blocked", "failed"}:
+        status = "failed"
+    summary = str(payload.get("summary") or "").strip()[:2000] or f"{role.role_id} returned no summary for {artifact_kind}."
+
+    proposed_patches = [
+        ProposedPatch(
+            patch_id=str(patch.get("patch_id", f"{role.role_id}-patch-{index}")),
+            summary=str(patch.get("summary", "")),
+            unified_diff=str(patch.get("unified_diff", "")),
+            target_role=role.role_id,
+        )
+        for index, patch in enumerate(payload.get("proposed_patches", []) or [])
+        if isinstance(patch, dict) and patch.get("unified_diff")
+    ]
+
+    writeback_items = [
+        MemoryWriteback(
+            role_id=role.role_id,
+            namespace=role.private_memory_namespace,
+            scope="private",
+            text=str(item.get("text", ""))[:2000],
+            tags=["ragnar", "role_result", f"role:{role.role_id}", f"artifact:{artifact_kind}"]
+            + [str(tag) for tag in item.get("tags", []) if isinstance(tag, (str, int, float))],
+            source_run_id=run_id,
+            source_artifact=artifact_kind,
+        )
+        for item in (payload.get("memory_writebacks", []) or [])
+        if isinstance(item, dict) and item.get("text")
+    ]
+    if not writeback_items:
+        writeback_items = [
+            MemoryWriteback(
+                role_id=role.role_id,
+                namespace=role.private_memory_namespace,
+                scope="private",
+                text=f"{role.role_id} prepared {artifact_kind} for run {run_id}. Summary: {summary}",
+                tags=["ragnar", "role_result", f"role:{role.role_id}", f"artifact:{artifact_kind}"],
+                source_run_id=run_id,
+                source_artifact=artifact_kind,
+            )
+        ]
+
+    proposed_actions = [
+        {
+            "role_id": role.role_id,
+            "action": str(item["action"]),
+            "reason": str(item.get("reason", "Proposed by role agent; requires policy review.")),
+        }
+        for item in (payload.get("proposed_actions", []) or [])
+        if isinstance(item, dict) and item.get("action")
+    ]
+
+    return RoleAgentResult(
+        schema_version=SCHEMA_VERSION,
+        run_id=run_id,
+        role_id=role.role_id,
+        status=status,
+        summary=summary,
+        proposed_patches=proposed_patches,
+        handoffs=_deterministic_handoffs(role, artifact_kind, summary),
+        memory_writebacks=writeback_items,
+        proposed_actions=proposed_actions,
+    )
+
+
+_BUILD_ROLE_IDS = {"backend_engineer", "frontend_engineer", "workflow_engineer"}
+
+
+def review_result_from_reply(run_id: str, role: RoleContract, reply_text: str) -> RoleReviewResult:
+    """Parse a conductor review reply into a RoleReviewResult.
+
+    Unlike agent_result_from_reply, a parse failure here defaults to
+    verdict="approve" rather than a "failed" status. This result IS the
+    routing signal for the graph -- a transient malformed reply must not
+    silently burn a retry-cap slot or force a rework loop. The deterministic
+    QA command results and the human approval_gate remain the real safety
+    net downstream regardless of this parser's outcome.
+    """
+    from .role_runtime import extract_json_object
+
+    try:
+        payload = json.loads(extract_json_object(reply_text))
+        if not isinstance(payload, dict):
+            raise ValueError("reply JSON is not an object")
+    except (json.JSONDecodeError, ValueError):
+        return RoleReviewResult(
+            schema_version=SCHEMA_VERSION,
+            run_id=run_id,
+            role_id=role.role_id,
+            verdict="approve",
+            feedback=f"Provider reply for {role.role_id} was not valid JSON; auto-approved.",
+            rework_roles=[],
+        )
+
+    verdict = str(payload.get("verdict", "approve"))
+    if verdict not in {"approve", "revise"}:
+        verdict = "approve"
+    feedback = str(payload.get("feedback") or "").strip()[:2000]
+    rework_roles = [
+        str(item) for item in (payload.get("rework_roles", []) or []) if str(item) in _BUILD_ROLE_IDS
+    ]
+
+    return RoleReviewResult(
+        schema_version=SCHEMA_VERSION,
+        run_id=run_id,
+        role_id=role.role_id,
+        verdict=verdict,
+        feedback=feedback,
+        rework_roles=rework_roles,
     )
 
 
