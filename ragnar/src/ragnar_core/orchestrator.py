@@ -4,12 +4,18 @@ import argparse
 import json
 import operator
 import os
+import shlex
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
 
+from .approval_store import ApprovalStore, default_approvals_path
 from .approval_broker import ApprovalBroker, Decision
+from .context_memory import ContextMemoryProvider, MemoryMode
+from .execution import LocalExecutionAdapter
+from .observability import RunRecorder, default_runs_path
+from .role_runtime import RoleRuntime, default_manifest_path
 from .role_registry import RoleContract, RoleRegistry, load_role_registry
 
 
@@ -24,6 +30,8 @@ class RagnarState(TypedDict, total=False):
     phase: str
     selected_build_roles: list[str]
     context_queries: list[dict[str, Any]]
+    memory_context: list[dict[str, Any]]
+    qa_commands: list[list[str]]
     artifacts: Annotated[list[dict[str, Any]], operator.add]
     audit_events: Annotated[list[dict[str, Any]], operator.add]
     proposed_actions: Annotated[list[dict[str, Any]], operator.add]
@@ -80,9 +88,26 @@ class RagnarOrchestrator:
     internally, but they cannot skip graph gates or perform outward actions.
     """
 
-    def __init__(self, registry: RoleRegistry) -> None:
+    def __init__(
+        self,
+        registry: RoleRegistry,
+        memory_mode: MemoryMode = "off",
+        qa_commands: list[list[str]] | None = None,
+        approvals_path: Path | None = None,
+        runs_path: Path | None = None,
+        manifest_path: Path | None = None,
+        record_runs: bool = True,
+    ) -> None:
         self.registry = registry
         self.approval_broker = ApprovalBroker()
+        repo_root = _repo_root()
+        self.memory_provider = ContextMemoryProvider(mode=memory_mode)
+        self.execution = LocalExecutionAdapter(repo_root)
+        self.role_runtime = RoleRuntime(manifest_path or default_manifest_path(repo_root))
+        self.approval_store = ApprovalStore(approvals_path or default_approvals_path(repo_root))
+        self.recorder = RunRecorder(runs_path or default_runs_path(repo_root))
+        self.qa_commands = qa_commands or []
+        self.record_runs = record_runs
 
     def build_graph(self, checkpointer: Any | None = None) -> Any:
         try:
@@ -136,18 +161,28 @@ class RagnarOrchestrator:
 
         return graph.compile(checkpointer=checkpointer or InMemorySaver())
 
-    def invoke(self, objective: str, thread_id: str | None = None, checkpoint_db: Path | None = None) -> RagnarState:
-        run_id = str(uuid.uuid4())
+    def invoke(
+        self,
+        objective: str,
+        thread_id: str | None = None,
+        checkpoint_db: Path | None = None,
+        run_id: str | None = None,
+    ) -> RagnarState:
+        run_id = run_id or str(uuid.uuid4())
         config = {"configurable": {"thread_id": thread_id or run_id}}
         initial_state = {
             "run_id": run_id,
             "objective": objective,
             "mode": "strict_intelligent",
             "phase": "created",
+            "qa_commands": self.qa_commands,
         }
         if checkpoint_db is None:
             app = self.build_graph()
-            return app.invoke(initial_state, config=config)
+            state = app.invoke(initial_state, config=config)
+            if self.record_runs:
+                state["observability"] = self.recorder.write(state)
+            return state
 
         os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
         try:
@@ -159,7 +194,10 @@ class RagnarOrchestrator:
         checkpoint_db.parent.mkdir(parents=True, exist_ok=True)
         with SqliteSaver.from_conn_string(str(checkpoint_db)) as checkpointer:
             app = self.build_graph(checkpointer=checkpointer)
-            return app.invoke(initial_state, config=config)
+            state = app.invoke(initial_state, config=config)
+            if self.record_runs:
+                state["observability"] = self.recorder.write(state)
+            return state
 
     def intake_objective(self, state: RagnarState) -> dict[str, Any]:
         objective = state["objective"].strip()
@@ -174,10 +212,13 @@ class RagnarOrchestrator:
         conductor = self.registry.get("conductor")
         objective = state["objective"]
         selected_roles = self._select_build_roles(objective)
+        context_queries = self._context_queries(objective, selected_roles)
+        memory_context = self.memory_provider.retrieve(context_queries)
         return {
             "phase": "triaged",
             "selected_build_roles": selected_roles,
-            "context_queries": self._context_queries(objective, selected_roles),
+            "context_queries": context_queries,
+            "memory_context": memory_context,
             "artifacts": [
                 _artifact(
                     "conductor_triage",
@@ -186,7 +227,12 @@ class RagnarOrchestrator:
                         "objective": objective,
                         "selected_build_roles": selected_roles,
                         "role_contract": _role_summary(conductor),
-                        "routing_rule": "deterministic keyword routing with conservative backend default",
+                        "routing_rule": "deterministic phrase and keyword routing with conservative backend default",
+                        "memory_lookups": {
+                            "queries": len(context_queries),
+                            "hits": sum(len(item.get("hits", [])) for item in memory_context),
+                            "errors": sum(len(item.get("errors", [])) for item in memory_context),
+                        },
                     },
                 )
             ],
@@ -273,7 +319,17 @@ class RagnarOrchestrator:
         if decision.decision is not Decision.ALLOW:
             raise RuntimeError(f"QA gate is not allowed: {decision.reason}")
         build_packets = [artifact for artifact in state.get("artifacts", []) if artifact["kind"].endswith("_work_packet")]
-        verdict = "pass_with_warnings" if build_packets else "fail"
+        command_results = [self.execution.run(command).to_dict() for command in state.get("qa_commands", [])]
+        command_failed = any(result["exit_code"] != 0 for result in command_results)
+        if command_failed or not build_packets:
+            verdict = "fail"
+        elif command_results:
+            verdict = "pass"
+        else:
+            verdict = "pass_with_warnings"
+        warnings = []
+        if not command_results:
+            warnings.append("No real QA command was configured for this run.")
         return {
             "phase": "qa_complete",
             "artifacts": [
@@ -283,10 +339,8 @@ class RagnarOrchestrator:
                     {
                         "verdict": verdict,
                         "reviewed_artifacts": [artifact["kind"] for artifact in build_packets],
-                        "warnings": [
-                            "This is an orchestration dry run; no real test command has executed yet.",
-                            "Real execution adapters must attach test reports before this can become pass.",
-                        ],
+                        "commands": command_results,
+                        "warnings": warnings,
                     },
                 )
             ],
@@ -330,13 +384,26 @@ class RagnarOrchestrator:
             if decision.decision is Decision.DENY:
                 raise RuntimeError(f"Denied proposed action {proposed['action']}: {decision.reason}")
             if decision.decision is Decision.REQUIRE_APPROVAL:
+                latest = self.approval_store.latest(state["run_id"], role.role_id, str(proposed["action"]))
+                if latest and latest.status == "approved":
+                    continue
+                if latest and latest.status == "denied":
+                    raise RuntimeError(f"Owner denied {role.role_id}/{proposed['action']}: {latest.reason}")
+                if latest is None:
+                    latest = self.approval_store.record(
+                        state["run_id"],
+                        role.role_id,
+                        str(proposed["action"]),
+                        "pending",
+                        decision.reason,
+                    )
                 blocked = True
                 approval_requests.append(
                     {
                         "role_id": role.role_id,
                         "action": proposed["action"],
                         "reason": decision.reason,
-                        "requested_at": _now(),
+                        "requested_at": latest.recorded_at,
                         "status": "pending_owner_approval",
                     }
                 )
@@ -386,13 +453,60 @@ class RagnarOrchestrator:
         return "qa_gate"
 
     def _select_build_roles(self, objective: str) -> list[str]:
-        words = _tokens(objective)
+        normalized = objective.lower().replace("-", "_").replace("/", " ")
+        words = _tokens(normalized)
         selected: list[str] = []
-        if words & {"api", "apis", "backend", "database", "db", "migration", "migrations", "schema", "service", "pipeline"}:
+        backend_terms = {
+            "api",
+            "apis",
+            "backend",
+            "database",
+            "db",
+            "migration",
+            "migrations",
+            "schema",
+            "service",
+            "pipeline",
+            "auth",
+            "login",
+            "endpoint",
+            "worker",
+            "queue",
+        }
+        frontend_terms = {
+            "ui",
+            "ux",
+            "frontend",
+            "page",
+            "pages",
+            "react",
+            "screen",
+            "component",
+            "components",
+            "css",
+            "style",
+            "form",
+            "dashboard",
+            "button",
+        }
+        workflow_terms = {
+            "workflow",
+            "automation",
+            "webhook",
+            "webhooks",
+            "integration",
+            "integrations",
+            "connector",
+            "flow",
+            "zapier",
+            "n8n",
+            "trigger",
+        }
+        if words & backend_terms or any(phrase in normalized for phrase in ("data model", "business logic", "rest api")):
             selected.append("backend_engineer")
-        if words & {"ui", "ux", "frontend", "page", "pages", "react", "screen", "component", "components", "css", "style"}:
+        if words & frontend_terms or any(phrase in normalized for phrase in ("user interface", "design system", "landing page")):
             selected.append("frontend_engineer")
-        if words & {"workflow", "automation", "webhook", "webhooks", "integration", "integrations", "connector", "flow"}:
+        if words & workflow_terms or any(phrase in normalized for phrase in ("third party", "third_party", "external system")):
             selected.append("workflow_engineer")
         if not selected:
             selected.append("backend_engineer")
@@ -427,6 +541,8 @@ class RagnarOrchestrator:
         decision = self.approval_broker.decide(role, action)
         if decision.decision is Decision.DENY:
             raise RuntimeError(f"{role_id} cannot run {action}: {decision.reason}")
+        role_context = self._role_memory_context(state, role)
+        runtime_result = self.role_runtime.run(role, state["objective"], action, role_context)
         return {
             "phase": f"{role_id}_complete",
             "artifacts": [
@@ -439,8 +555,13 @@ class RagnarOrchestrator:
                         "policy_decision": decision.decision.value,
                         "role_contract": _role_summary(role),
                         "context_queries": [
-                            query for query in state.get("context_queries", []) if query.get("namespace") in role.memory.get("shared_namespaces", []) or query.get("namespace") == role.private_memory_namespace
+                            query
+                            for query in state.get("context_queries", [])
+                            if query.get("namespace") in role.memory.get("shared_namespaces", [])
+                            or query.get("namespace") == role.private_memory_namespace
                         ],
+                        "memory_context": role_context,
+                        "role_runtime": runtime_result.to_dict(),
                         "notes": notes,
                     },
                 )
@@ -448,10 +569,34 @@ class RagnarOrchestrator:
             "audit_events": [_event(role_id, "completed bounded role node", action=action)],
         }
 
+    def _role_memory_context(self, state: RagnarState, role: RoleContract) -> list[dict[str, Any]]:
+        namespaces = set(role.memory.get("shared_namespaces", []))
+        namespaces.add(role.private_memory_namespace)
+        role_context = []
+        for item in state.get("memory_context", []):
+            query = item.get("query", {})
+            if query.get("namespace") in namespaces:
+                role_context.append(item)
+        return role_context
 
-def run_objective(objective: str, roles_path: Path | None = None, checkpoint_db: Path | None = None) -> RagnarState:
+
+def run_objective(
+    objective: str,
+    roles_path: Path | None = None,
+    checkpoint_db: Path | None = None,
+    run_id: str | None = None,
+    memory_mode: MemoryMode = "off",
+    qa_commands: list[list[str]] | None = None,
+    record_runs: bool = False,
+) -> RagnarState:
     registry = load_role_registry(roles_path or _default_roles_path())
-    return RagnarOrchestrator(registry).invoke(objective, checkpoint_db=checkpoint_db)
+    orchestrator = RagnarOrchestrator(
+        registry,
+        memory_mode=memory_mode,
+        qa_commands=qa_commands,
+        record_runs=record_runs,
+    )
+    return orchestrator.invoke(objective, checkpoint_db=checkpoint_db, run_id=run_id)
 
 
 def main() -> None:
@@ -459,11 +604,34 @@ def main() -> None:
     parser.add_argument("objective")
     parser.add_argument("--roles", type=Path, default=_default_roles_path())
     parser.add_argument("--checkpoint-db", type=Path, default=_default_checkpoint_path())
+    parser.add_argument("--run-id", help="Reuse a run ID, usually after approving a pending action.")
+    parser.add_argument(
+        "--memory-mode",
+        choices=["off", "auto", "pgvector", "graphiti", "all"],
+        default="auto",
+        help="Memory retrieval mode. Graphiti requires its local service and provider config.",
+    )
+    parser.add_argument(
+        "--qa-command",
+        action="append",
+        default=[],
+        help="Local QA command to run, split with shell-like spaces. Can be passed multiple times.",
+    )
     parser.add_argument("--no-checkpoint", action="store_true", help="Use in-memory checkpoints for this run.")
+    parser.add_argument("--no-record-runs", action="store_true", help="Do not write .ragnar/runs observability files.")
     parser.add_argument("--json", action="store_true", help="Print the full graph state as JSON.")
     args = parser.parse_args()
 
-    state = run_objective(args.objective, args.roles, None if args.no_checkpoint else args.checkpoint_db)
+    qa_commands = [shlex.split(command) for command in args.qa_command]
+    state = run_objective(
+        args.objective,
+        args.roles,
+        None if args.no_checkpoint else args.checkpoint_db,
+        run_id=args.run_id,
+        memory_mode=args.memory_mode,
+        qa_commands=qa_commands,
+        record_runs=not args.no_record_runs,
+    )
     if args.json:
         print(json.dumps(state, indent=2, default=str))
         return

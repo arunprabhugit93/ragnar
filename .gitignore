@@ -26,6 +26,8 @@ node_modules/
 # Runtime data
 .ragnar/runtime/
 .ragnar/logs/
+.ragnar/runs/
+.ragnar/approvals.jsonl
 *.log
 *.sqlite
 *.sqlite3
