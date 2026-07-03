@@ -1,0 +1,29 @@
+.DS_Store
+
+# Python/local build output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Local environments and package caches
+.venv/
+venv/
+node_modules/
+.pnpm-store/
+
+# Local secrets and generated certificates
+*.key
+*-key.pem
+*.pem
+.env.local
+.env.*.local
+
+# Runtime data
+.matron/runtime/
+.matron/logs/
+*.log

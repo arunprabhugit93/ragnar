@@ -1,0 +1,46 @@
+services:
+  falkordb:
+    image: falkordb/falkordb:latest
+    ports:
+      - "6380:6379"
+      - "3001:3000"
+    environment:
+      - FALKORDB_PASSWORD=${FALKORDB_PASSWORD:-}
+      - BROWSER=${BROWSER:-1}
+    volumes:
+      - matron_falkordb_data:/var/lib/falkordb/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  graphiti-mcp:
+    image: zepai/knowledge-graph-mcp:standalone
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.standalone
+    env_file:
+      - path: ../.env
+        required: false
+    depends_on:
+      falkordb:
+        condition: service_healthy
+    environment:
+      - FALKORDB_URI=${FALKORDB_URI:-redis://falkordb:6379}
+      - FALKORDB_PASSWORD=${FALKORDB_PASSWORD:-}
+      - FALKORDB_DATABASE=${FALKORDB_DATABASE:-matron}
+      - GRAPHITI_GROUP_ID=${GRAPHITI_GROUP_ID:-matron}
+      - SEMAPHORE_LIMIT=${SEMAPHORE_LIMIT:-2}
+      - CONFIG_PATH=/app/mcp/config/config.yaml
+      - PATH=/root/.local/bin:${PATH}
+    volumes:
+      - ../config/config-docker-falkordb.yaml:/app/mcp/config/config.yaml:ro
+    ports:
+      - "8000:8000"
+    command: ["uv", "run", "--no-sync", "main.py"]
+
+volumes:
+  matron_falkordb_data:
+    driver: local

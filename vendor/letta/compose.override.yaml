@@ -1,0 +1,7 @@
+services:
+  letta_db:
+    ports: !override
+      - "55432:5432"
+  letta_server:
+    environment:
+      - LETTA_PG_URI=postgresql://letta:letta@letta-db:5432/letta

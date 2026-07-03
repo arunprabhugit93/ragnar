@@ -1,0 +1,31 @@
+name: Label title prefix
+on:
+  issues:
+    types: [labeled]
+  pull_request_target:
+    types: [labeled]
+
+jobs:
+  add_title_prefix:
+    name: "Issue/PR: add title prefix"
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          sparse-checkout: .github/scripts
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        name: "Issue/PR: update title"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { updateTitleForAddedLabel } = require('./.github/scripts/title_prefix.js');
+            await updateTitleForAddedLabel({ github, context, core });

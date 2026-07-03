@@ -1,0 +1,382 @@
+version: 0.1
+
+principles:
+  iron_rule: "Reads and research run free; every outward action waits for owner approval."
+  enforcement: "Policy broker outside the LLM."
+  audit: "Append-only audit trail for role, action, input, output, approval, timestamp, and artifact."
+
+roles:
+  - role_id: conductor
+    display_name: Matron
+    team: conductor
+    responsibility:
+      - Hold the single source of truth across projects.
+      - Plan daily work.
+      - Dispatch specialist roles.
+      - Reconcile findings into decision-first briefings.
+      - Put owner decisions in front of the human owner.
+    authority:
+      can:
+        - read_project_state
+        - create_tasks
+        - assign_tasks
+        - summarize_status
+        - request_approval
+      cannot:
+        - approve_own_work
+        - push_code
+        - merge_pr
+        - deploy
+        - spend_money_without_approval
+    memory:
+      private_namespace: roles/conductor
+      shared_namespaces:
+        - portfolio
+        - decisions
+        - project_context
+    handoffs:
+      sends_to:
+        - project_registrar
+        - live_ops_monitor
+        - researcher
+        - correspondence_drafter
+        - portfolio_editor
+        - delivery_architect
+
+  - role_id: project_registrar
+    display_name: Curator
+    team: watch
+    responsibility:
+      - Keep every project's stage accurate.
+      - Keep every project's health accurate.
+      - Flag stalls and overdue gate reviews.
+      - Track freshness of portfolio data.
+    authority:
+      can:
+        - read_repos
+        - read_issue_trackers
+        - read_deploy_status
+        - update_internal_project_registry
+      requires_approval:
+        - external_status_change
+        - notify_human_outside_system
+    memory:
+      private_namespace: roles/project_registrar
+      shared_namespaces:
+        - portfolio
+        - project_context
+
+  - role_id: live_ops_monitor
+    display_name: Sentinel
+    team: watch
+    responsibility:
+      - Monitor uptime.
+      - Monitor errors.
+      - Monitor deploys.
+      - Monitor cost.
+      - Raise incidents with suggested fixes.
+    authority:
+      can:
+        - read_logs
+        - read_metrics
+        - read_traces
+        - classify_incidents
+        - propose_remediation
+      requires_approval:
+        - restart_service
+        - rollback_deploy
+        - create_external_incident
+        - page_human
+    memory:
+      private_namespace: roles/live_ops_monitor
+      shared_namespaces:
+        - operations
+        - incidents
+        - project_context
+
+  - role_id: researcher
+    display_name: Scout
+    team: watch
+    responsibility:
+      - Find improvements.
+      - Track new libraries.
+      - Track competitor moves.
+      - Return briefs, not noise.
+    authority:
+      can:
+        - web_research
+        - dependency_research
+        - repo_research
+        - produce_research_brief
+      cannot:
+        - change_code
+        - open_pr
+        - send_external_messages
+    memory:
+      private_namespace: roles/researcher
+      shared_namespaces:
+        - research
+        - project_context
+
+  - role_id: correspondence_drafter
+    display_name: Postman
+    team: watch
+    responsibility:
+      - Triage project email.
+      - Draft replies.
+      - Never send without owner approval.
+    authority:
+      can:
+        - read_inbox
+        - classify_messages
+        - draft_reply
+        - propose_followup
+      requires_approval:
+        - send_email
+        - send_message
+        - create_calendar_invite
+    memory:
+      private_namespace: roles/correspondence_drafter
+      shared_namespaces:
+        - communications
+        - project_context
+
+  - role_id: portfolio_editor
+    display_name: Scribe
+    team: watch
+    responsibility:
+      - Compose decision-first morning briefings.
+      - Compose weekly portfolio reviews.
+      - Turn project state into owner-readable reports.
+    authority:
+      can:
+        - read_project_state
+        - read_incidents
+        - read_research_briefs
+        - draft_reports
+      requires_approval:
+        - send_report
+        - publish_report
+    memory:
+      private_namespace: roles/portfolio_editor
+      shared_namespaces:
+        - portfolio
+        - decisions
+        - project_context
+
+  - role_id: delivery_architect
+    display_name: Architect
+    team: build
+    responsibility:
+      - Decompose an objective into scoped ordered tasks.
+      - Define acceptance criteria.
+      - Plan only.
+    authority:
+      can:
+        - read_codebase
+        - inspect_architecture
+        - create_delivery_plan
+        - create_task_breakdown
+      cannot:
+        - edit_code
+        - push_code
+        - merge_pr
+        - deploy
+    memory:
+      private_namespace: roles/delivery_architect
+      shared_namespaces:
+        - architecture
+        - decisions
+        - project_context
+    handoffs:
+      sends_to:
+        - backend_engineer
+        - frontend_engineer
+        - workflow_engineer
+        - qa_engineer
+
+  - role_id: backend_engineer
+    display_name: Backend
+    team: build
+    responsibility:
+      - Services.
+      - APIs.
+      - Business logic.
+      - Data models.
+      - Database schema and migrations.
+      - Pipelines.
+    authority:
+      can:
+        - read_codebase
+        - edit_backend_worktree
+        - run_backend_tests
+        - draft_migrations
+      requires_approval:
+        - push_branch
+        - run_destructive_migration
+        - modify_production_data
+    isolation:
+      branch: role_scoped_branch
+      worktree: isolated_worktree
+      surface: backend
+    memory:
+      private_namespace: roles/backend_engineer
+      shared_namespaces:
+        - architecture
+        - qa_findings
+        - project_context
+    handoffs:
+      receives_from:
+        - delivery_architect
+        - qa_engineer
+      sends_to:
+        - qa_engineer
+        - integrator
+
+  - role_id: frontend_engineer
+    display_name: Frontend
+    team: build
+    responsibility:
+      - UI components.
+      - Pages.
+      - Client state.
+      - Styling.
+      - User-facing experience.
+    authority:
+      can:
+        - read_codebase
+        - edit_frontend_worktree
+        - run_frontend_build
+        - run_ui_tests
+      requires_approval:
+        - push_branch
+        - change_public_branding
+        - publish_frontend
+    isolation:
+      branch: role_scoped_branch
+      worktree: isolated_worktree
+      surface: frontend
+    memory:
+      private_namespace: roles/frontend_engineer
+      shared_namespaces:
+        - architecture
+        - qa_findings
+        - project_context
+    handoffs:
+      receives_from:
+        - delivery_architect
+        - qa_engineer
+      sends_to:
+        - qa_engineer
+        - integrator
+
+  - role_id: workflow_engineer
+    display_name: Flow
+    team: build
+    responsibility:
+      - Automation.
+      - Workflow definitions.
+      - Webhooks.
+      - Wiring between systems.
+    authority:
+      can:
+        - read_workflow_configs
+        - edit_workflow_worktree
+        - test_webhooks_locally
+        - propose_integration_changes
+      requires_approval:
+        - enable_external_webhook
+        - change_production_workflow
+        - trigger_external_action
+    isolation:
+      branch: role_scoped_branch
+      worktree: isolated_worktree
+      surface: workflow
+    memory:
+      private_namespace: roles/workflow_engineer
+      shared_namespaces:
+        - integrations
+        - qa_findings
+        - project_context
+    handoffs:
+      receives_from:
+        - delivery_architect
+        - qa_engineer
+      sends_to:
+        - qa_engineer
+        - integrator
+
+  - role_id: qa_engineer
+    display_name: QA
+    team: build
+    responsibility:
+      - Write integration and end-to-end tests.
+      - Run ship/no-ship gates.
+      - Validate acceptance criteria.
+      - Produce quality verdicts.
+    authority:
+      can:
+        - read_all_role_branches
+        - run_tests
+        - inspect_diffs
+        - produce_qa_verdict
+      cannot:
+        - approve_own_verdict
+        - merge_pr
+        - deploy
+    verdicts:
+      - pass
+      - fail
+      - pass_with_warnings
+    memory:
+      private_namespace: roles/qa_engineer
+      shared_namespaces:
+        - quality
+        - qa_findings
+        - project_context
+    handoffs:
+      receives_from:
+        - delivery_architect
+        - backend_engineer
+        - frontend_engineer
+        - workflow_engineer
+      sends_to:
+        - backend_engineer
+        - frontend_engineer
+        - workflow_engineer
+        - integrator
+
+  - role_id: integrator
+    display_name: Forge
+    team: build
+    responsibility:
+      - Merge engineer branches into one clean pull request.
+      - Resolve integration conflicts.
+      - Assemble the final diff.
+      - Never push to main.
+    authority:
+      can:
+        - read_engineer_branches
+        - create_integration_branch
+        - merge_feature_branches
+        - open_pull_request_draft
+      requires_approval:
+        - open_pull_request
+        - mark_pr_ready
+        - push_branch
+      cannot:
+        - push_to_main
+        - merge_to_main
+        - deploy
+    memory:
+      private_namespace: roles/integrator
+      shared_namespaces:
+        - integration
+        - decisions
+        - project_context
+    handoffs:
+      receives_from:
+        - qa_engineer
+        - backend_engineer
+        - frontend_engineer
+        - workflow_engineer

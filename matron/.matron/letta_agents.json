@@ -1,0 +1,151 @@
+{
+  "agents": {
+    "backend_engineer": {
+      "display_name": "Backend",
+      "letta_agent_id": "agent-3f768a1e-d8a5-4c85-968f-2c054a02318f",
+      "private_memory_namespace": "roles/backend_engineer",
+      "role_id": "backend_engineer",
+      "tags": [
+        "matron",
+        "role:backend_engineer",
+        "team:build",
+        "memory:roles/backend_engineer"
+      ]
+    },
+    "conductor": {
+      "display_name": "Matron",
+      "letta_agent_id": "agent-303ddfdf-9404-43a8-8159-96f9ab763950",
+      "private_memory_namespace": "roles/conductor",
+      "role_id": "conductor",
+      "tags": [
+        "matron",
+        "role:conductor",
+        "team:conductor",
+        "memory:roles/conductor"
+      ]
+    },
+    "correspondence_drafter": {
+      "display_name": "Postman",
+      "letta_agent_id": "agent-dc94e2a4-5156-46c5-90b1-e3d3c623ec03",
+      "private_memory_namespace": "roles/correspondence_drafter",
+      "role_id": "correspondence_drafter",
+      "tags": [
+        "matron",
+        "role:correspondence_drafter",
+        "team:watch",
+        "memory:roles/correspondence_drafter"
+      ]
+    },
+    "delivery_architect": {
+      "display_name": "Architect",
+      "letta_agent_id": "agent-3c1f184b-b644-4ae9-956e-b55466cb5511",
+      "private_memory_namespace": "roles/delivery_architect",
+      "role_id": "delivery_architect",
+      "tags": [
+        "matron",
+        "role:delivery_architect",
+        "team:build",
+        "memory:roles/delivery_architect"
+      ]
+    },
+    "frontend_engineer": {
+      "display_name": "Frontend",
+      "letta_agent_id": "agent-419b0109-fff2-4351-bf18-3ba3c5d772fc",
+      "private_memory_namespace": "roles/frontend_engineer",
+      "role_id": "frontend_engineer",
+      "tags": [
+        "matron",
+        "role:frontend_engineer",
+        "team:build",
+        "memory:roles/frontend_engineer"
+      ]
+    },
+    "integrator": {
+      "display_name": "Forge",
+      "letta_agent_id": "agent-91f905b1-cd7c-4981-87d3-bb486f40ef27",
+      "private_memory_namespace": "roles/integrator",
+      "role_id": "integrator",
+      "tags": [
+        "matron",
+        "role:integrator",
+        "team:build",
+        "memory:roles/integrator"
+      ]
+    },
+    "live_ops_monitor": {
+      "display_name": "Sentinel",
+      "letta_agent_id": "agent-997713d7-1a08-4ffb-888e-249e719d1090",
+      "private_memory_namespace": "roles/live_ops_monitor",
+      "role_id": "live_ops_monitor",
+      "tags": [
+        "matron",
+        "role:live_ops_monitor",
+        "team:watch",
+        "memory:roles/live_ops_monitor"
+      ]
+    },
+    "portfolio_editor": {
+      "display_name": "Scribe",
+      "letta_agent_id": "agent-d198399e-1e8f-4c7c-8986-7c76d93f2da3",
+      "private_memory_namespace": "roles/portfolio_editor",
+      "role_id": "portfolio_editor",
+      "tags": [
+        "matron",
+        "role:portfolio_editor",
+        "team:watch",
+        "memory:roles/portfolio_editor"
+      ]
+    },
+    "project_registrar": {
+      "display_name": "Curator",
+      "letta_agent_id": "agent-ce405d39-cb34-4091-8382-76edbb950695",
+      "private_memory_namespace": "roles/project_registrar",
+      "role_id": "project_registrar",
+      "tags": [
+        "matron",
+        "role:project_registrar",
+        "team:watch",
+        "memory:roles/project_registrar"
+      ]
+    },
+    "qa_engineer": {
+      "display_name": "QA",
+      "letta_agent_id": "agent-5ea9c656-3b35-442e-9ab0-30181247ab27",
+      "private_memory_namespace": "roles/qa_engineer",
+      "role_id": "qa_engineer",
+      "tags": [
+        "matron",
+        "role:qa_engineer",
+        "team:build",
+        "memory:roles/qa_engineer"
+      ]
+    },
+    "researcher": {
+      "display_name": "Scout",
+      "letta_agent_id": "agent-cfedcf74-f726-4270-8519-e3553bedfcbb",
+      "private_memory_namespace": "roles/researcher",
+      "role_id": "researcher",
+      "tags": [
+        "matron",
+        "role:researcher",
+        "team:watch",
+        "memory:roles/researcher"
+      ]
+    },
+    "workflow_engineer": {
+      "display_name": "Flow",
+      "letta_agent_id": "agent-545e2e29-10b2-43bb-8f6b-e1116b00165a",
+      "private_memory_namespace": "roles/workflow_engineer",
+      "role_id": "workflow_engineer",
+      "tags": [
+        "matron",
+        "role:workflow_engineer",
+        "team:build",
+        "memory:roles/workflow_engineer"
+      ]
+    }
+  },
+  "base_url": "http://127.0.0.1:8283",
+  "embedding": "letta/letta-free",
+  "model": "letta/letta-free"
+}
