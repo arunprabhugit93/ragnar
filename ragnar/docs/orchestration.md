@@ -56,6 +56,39 @@ cd ragnar
 ragnar-orchestrate "build a frontend settings page with backend API and webhook integration"
 ```
 
+## Terminal Chat
+
+Use `ragnar-chat` when you want to develop from a terminal prompt:
+
+```sh
+cd ragnar
+. .venv/bin/activate
+ragnar-chat --memory-mode off --no-worktrees
+```
+
+Then type an objective:
+
+```text
+ragnar> build backend API and frontend settings page
+```
+
+Useful chat commands:
+
+```text
+/help
+/approvals last
+/approve last integrator open_pull_request
+/rerun
+/json on
+/quit
+```
+
+For one command without opening the REPL:
+
+```sh
+ragnar-chat --once "build backend API" --memory-mode off --no-worktrees
+```
+
 By default the CLI uses SQLite checkpoints at `.ragnar/orchestrator.sqlite`. For a temporary in-memory run:
 
 ```sh

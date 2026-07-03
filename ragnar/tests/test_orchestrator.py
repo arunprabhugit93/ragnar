@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from ragnar_core.chat import ChatSession, render_state
 from ragnar_core.config import load_config
 from ragnar_core.edit_adapter import SafePatchAdapter, extract_changed_files
 from ragnar_core.orchestrator import run_objective
@@ -171,3 +172,26 @@ def test_config_and_pr_draft_shapes() -> None:
     assert draft.status == "draft_only"
     assert draft.source_branches == ["ragnar/run-1/backend_engineer"]
     assert draft.changed_files == ["src/service/users.py"]
+
+
+def test_chat_session_runs_objective_once() -> None:
+    session = ChatSession(
+        roles_path=Path("ragnar/roles/ragnar_roles.yaml"),
+        config_path=Path("ragnar/ragnar.yaml"),
+        memory_mode="off",
+        qa_commands=[],
+        prepare_worktrees=False,
+        record_runs=False,
+    )
+
+    output = session.run_objective("build dashboard UI")
+
+    assert "roles: frontend_engineer" in output
+    assert "approval required:" in output
+    assert session.last_run_id is not None
+
+
+def test_chat_render_json_mode() -> None:
+    rendered = render_state({"run_id": "run-1", "phase": "done", "selected_build_roles": []}, show_json=True)
+
+    assert '"run_id": "run-1"' in rendered
