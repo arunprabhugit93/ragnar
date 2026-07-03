@@ -274,6 +274,36 @@ def provider_free_result(
     )
 
 
+def provider_error_result(
+    run_id: str,
+    role: RoleContract,
+    artifact_kind: str,
+    error_message: str,
+) -> RoleAgentResult:
+    summary = f"Provider-backed role call failed for {role.role_id}: {error_message}"[:2000]
+    return RoleAgentResult(
+        schema_version=SCHEMA_VERSION,
+        run_id=run_id,
+        role_id=role.role_id,
+        status="failed",
+        summary=summary,
+        proposed_patches=[],
+        handoffs=_deterministic_handoffs(role, artifact_kind, summary),
+        memory_writebacks=[
+            MemoryWriteback(
+                role_id=role.role_id,
+                namespace=role.private_memory_namespace,
+                scope="private",
+                text=summary,
+                tags=["ragnar", "provider_error", f"role:{role.role_id}", f"artifact:{artifact_kind}"],
+                source_run_id=run_id,
+                source_artifact=artifact_kind,
+            )
+        ],
+        proposed_actions=[],
+    )
+
+
 def agent_result_from_reply(
     run_id: str,
     role: RoleContract,

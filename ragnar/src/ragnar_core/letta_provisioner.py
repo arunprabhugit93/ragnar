@@ -25,6 +25,7 @@ class ProvisionedAgent:
     private_memory_namespace: str
     tags: list[str]
     model: str
+    max_tokens: int
     role_definition_version: str = ROLE_AGENT_DEFINITION_VERSION
 
 
@@ -310,6 +311,11 @@ def create_or_reuse_agents(
             return model
         return config.role_model(role_id).model
 
+    def max_tokens_for(role_id: str) -> int:
+        if config is None:
+            return 4096
+        return config.role_model(role_id).max_tokens
+
     embedding_for_run = config.embedding_model() if config is not None else embedding
 
     if dry_run:
@@ -321,6 +327,7 @@ def create_or_reuse_agents(
                 private_memory_namespace=role.private_memory_namespace,
                 tags=_tags(role),
                 model=model_for(role.role_id),
+                max_tokens=max_tokens_for(role.role_id),
             )
             for role in registry.all()
         ]
@@ -332,8 +339,20 @@ def create_or_reuse_agents(
         existing = agents_manifest.get(role.role_id)
         if existing and existing.get("letta_agent_id"):
             _sync_agent_definition_blocks(client, existing["letta_agent_id"], role)
+            update_payload = {
+                "model": model_for(role.role_id),
+                "max_tokens": max_tokens_for(role.role_id),
+                "tags": _tags(role),
+            }
+            update_signature = inspect.signature(client.agents.update)
+            supported_update = {
+                key: value for key, value in update_payload.items() if key in update_signature.parameters
+            }
+            if supported_update:
+                client.agents.update(existing["letta_agent_id"], **supported_update)
             existing["tags"] = _tags(role)
             existing["model"] = model_for(role.role_id)
+            existing["max_tokens"] = max_tokens_for(role.role_id)
             existing["role_definition_version"] = ROLE_AGENT_DEFINITION_VERSION
             agents_manifest[role.role_id] = existing
             _save_manifest(manifest_path, manifest)
@@ -345,6 +364,7 @@ def create_or_reuse_agents(
                     private_memory_namespace=role.private_memory_namespace,
                     tags=_tags(role),
                     model=model_for(role.role_id),
+                    max_tokens=max_tokens_for(role.role_id),
                 )
             )
             continue
@@ -355,6 +375,7 @@ def create_or_reuse_agents(
             "memory_blocks": _memory_blocks(role),
             "tags": _tags(role),
             "model": model_for(role.role_id),
+            "max_tokens": max_tokens_for(role.role_id),
             "embedding": embedding_for_run,
             "metadata": {
                 "system": "ragnar",
@@ -384,6 +405,7 @@ def create_or_reuse_agents(
             private_memory_namespace=role.private_memory_namespace,
             tags=_tags(role),
             model=model_for(role.role_id),
+            max_tokens=max_tokens_for(role.role_id),
         )
         agents_manifest[role.role_id] = asdict(record)
         provisioned.append(record)
@@ -440,7 +462,8 @@ def main() -> None:
     for record in records:
         print(
             f"{record.role_id:24s} {record.display_name:12s} "
-            f"letta_id={record.letta_agent_id} model={record.model} memory={record.private_memory_namespace}"
+            f"letta_id={record.letta_agent_id} model={record.model} "
+            f"max_tokens={record.max_tokens} memory={record.private_memory_namespace}"
         )
 
 

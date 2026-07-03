@@ -10,10 +10,11 @@ from typing import Any
 from ragnar_core.agent_transcripts import AgentTranscriptStore
 from ragnar_core.chat import ChatSession, render_state
 from ragnar_core.config import ModelConfig, RagnarConfig, load_config
-from ragnar_core.contracts import agent_result_from_reply, build_invocation_contract
+from ragnar_core.contracts import agent_result_from_reply, build_invocation_contract, provider_error_result
 from ragnar_core.edit_adapter import SafePatchAdapter, extract_changed_files
 from ragnar_core.letta_provisioner import (
     ROLE_AGENT_DEFINITION_VERSION,
+    create_or_reuse_agents,
     _memory_blocks,
     _sync_agent_definition_blocks,
 )
@@ -547,6 +548,18 @@ def test_live_reply_malformed_memory_writebacks_get_defaulted() -> None:
     assert "memory_writebacks was not an array" in result.summary
 
 
+def test_provider_error_result_is_failed_not_provider_free() -> None:
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    role = registry.get("frontend_engineer")
+
+    result = provider_error_result("run-test", role, "frontend_work_packet", "llm_insufficient_credits")
+
+    assert result.status == "failed"
+    assert "llm_insufficient_credits" in result.summary
+    assert result.proposed_patches == []
+    assert result.proposed_actions == []
+
+
 def test_letta_role_memory_defines_domain_stack_agnostic_operating_model() -> None:
     registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
     role = registry.get("backend_engineer")
@@ -619,6 +632,23 @@ def test_existing_letta_agent_definition_blocks_are_synced() -> None:
     assert client.agents.blocks.attachments == [
         {"block_id": "block-domain_stack_operating_model", "agent_id": "agent-frontend"}
     ]
+
+
+def test_letta_dry_run_uses_configured_role_max_tokens(tmp_path: Path) -> None:
+    manifest = tmp_path / "letta_agents.json"
+
+    records = create_or_reuse_agents(
+        roles_path=Path("ragnar/roles/ragnar_roles.yaml"),
+        manifest_path=manifest,
+        base_url="http://localhost:8283",
+        api_key=None,
+        model="letta/letta-free",
+        embedding="letta/letta-free",
+        dry_run=True,
+        config=load_config(Path("ragnar/ragnar.yaml")),
+    )
+
+    assert {record.role_id: record.max_tokens for record in records}["frontend_engineer"] == 4096
 
 
 def test_build_project_profile_detects_python(tmp_path: Path) -> None:

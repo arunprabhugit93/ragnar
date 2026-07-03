@@ -18,6 +18,7 @@ from .contracts import (
     agent_result_from_reply,
     build_invocation_contract,
     expected_review_output_schema,
+    provider_error_result,
     provider_free_result,
     review_result_from_reply,
     RoleReviewResult,
@@ -498,6 +499,8 @@ class RagnarOrchestrator:
         )
         if runtime_result.raw_reply is not None:
             agent_result = agent_result_from_reply(state["run_id"], qa, "qa_verdict", runtime_result.raw_reply)
+        elif runtime_result.status == "provider_error":
+            agent_result = provider_error_result(state["run_id"], qa, "qa_verdict", runtime_result.message)
         else:
             agent_result = provider_free_result(
                 state["run_id"], qa, "qa_verdict", f"Provider-free QA reasoning; deterministic verdict is {verdict}."
@@ -891,6 +894,8 @@ class RagnarOrchestrator:
         runtime_result = self.role_runtime.run(role, state["objective"], action, role_context, invocation=invocation)
         if runtime_result.raw_reply is not None:
             agent_result = agent_result_from_reply(state["run_id"], role, output_kind, runtime_result.raw_reply)
+        elif runtime_result.status == "provider_error":
+            agent_result = provider_error_result(state["run_id"], role, output_kind, runtime_result.message)
         else:
             agent_result = provider_free_result(
                 state["run_id"],
