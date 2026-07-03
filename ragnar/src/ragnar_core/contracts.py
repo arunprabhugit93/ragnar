@@ -73,6 +73,7 @@ class RoleInvocationContract:
     handoff_inputs: list[dict[str, Any]]
     expected_output_schema: dict[str, Any]
     rework_feedback: dict[str, Any] | None = None
+    project_profile: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -178,6 +179,7 @@ def build_invocation_contract(
     handoff_inputs: list[dict[str, Any]] | None = None,
     rework_feedback: dict[str, Any] | None = None,
     expected_output_schema: dict[str, Any] | None = None,
+    project_profile: dict[str, Any] | None = None,
 ) -> RoleInvocationContract:
     return RoleInvocationContract(
         schema_version=SCHEMA_VERSION,
@@ -194,6 +196,7 @@ def build_invocation_contract(
         handoff_inputs=handoff_inputs or [],
         expected_output_schema=expected_output_schema or expected_role_output_schema(),
         rework_feedback=rework_feedback,
+        project_profile=project_profile,
     )
 
 

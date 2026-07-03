@@ -201,6 +201,13 @@ def default_workspace_policies() -> dict[str, RoleWorkspacePolicy]:
                 "yarn test",
                 "yarn run",
                 "yarn build",
+                "go",
+                "cargo",
+                "mvn",
+                "gradle",
+                "bundle",
+                "rake",
+                "composer",
             ],
         ),
         "integrator": RoleWorkspacePolicy(

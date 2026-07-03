@@ -86,6 +86,15 @@ execution:
   # spirit -- raise this if you want more autonomous iteration before being asked.
   max_plan_revisions: 5
   max_qa_revisions: 5
+  # When true and no explicit --qa-command was given, qa_gate derives commands
+  # from project_profiler's test_commands and actually RUNS them for real.
+  # Off by default: if Ragnar is ever pointed at its own repo (e.g. during
+  # development/testing), an unguarded default here would make qa_gate
+  # discover and execute "pytest" from inside a process that may itself
+  # already be a pytest run, recursively re-collecting and re-running the
+  # whole suite. Only turn this on for a real target project, and prefer
+  # passing --qa-command explicitly when in doubt.
+  enable_qa_profile_discovery: false
 
 pull_requests:
   mode: draft_only

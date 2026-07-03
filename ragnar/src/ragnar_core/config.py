@@ -57,6 +57,9 @@ class RagnarConfig:
     def max_qa_revisions(self, default: int = 2) -> int:
         return int(self.raw.get("execution", {}).get("max_qa_revisions", default))
 
+    def enable_qa_profile_discovery(self) -> bool:
+        return bool(self.raw.get("execution", {}).get("enable_qa_profile_discovery", False))
+
     def to_dict(self) -> dict[str, Any]:
         return self.raw
 

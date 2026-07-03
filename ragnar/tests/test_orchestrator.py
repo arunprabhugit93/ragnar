@@ -17,8 +17,10 @@ from ragnar_core.letta_provisioner import (
     _memory_blocks,
     _sync_agent_definition_blocks,
 )
+from ragnar_core.execution import CommandResult
 from ragnar_core.orchestrator import MAX_PLAN_REVISIONS, RagnarOrchestrator, run_objective
 from ragnar_core.pr_adapter import build_pr_draft
+from ragnar_core.project_profiler import build_project_profile, qa_commands_from_profile
 from ragnar_core.role_registry import load_role_registry
 from ragnar_core.role_runtime import RoleRuntime, RoleRuntimeResult
 from ragnar_core.workspace import RoleWorkspaceManager
@@ -572,3 +574,166 @@ def test_existing_letta_agent_definition_blocks_are_synced() -> None:
     assert client.agents.blocks.attachments == [
         {"block_id": "block-domain_stack_operating_model", "agent_id": "agent-frontend"}
     ]
+
+
+def test_build_project_profile_detects_python(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text('[project]\ndescription = "A test service"\n', encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("pytest\n", encoding="utf-8")
+
+    profile = build_project_profile(tmp_path).to_dict()
+
+    assert profile["languages"] == ["python"]
+    assert profile["package_managers"] == ["pip"]
+    assert profile["test_commands"] == ["pytest"]
+    assert "A test service" in profile["domain_hints"]
+    assert profile["confidence"]["languages"] == 1.0
+
+
+def test_build_project_profile_detects_node(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        json.dumps({"description": "A frontend app", "scripts": {"test": "jest"}, "dependencies": {"react": "^18.0.0"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
+
+    profile = build_project_profile(tmp_path).to_dict()
+
+    assert profile["languages"] == ["javascript"]
+    assert profile["package_managers"] == ["npm"]
+    assert profile["frameworks"] == ["react"]
+    assert profile["test_commands"] == ["npm test"]
+    assert "A frontend app" in profile["domain_hints"]
+
+
+def test_build_project_profile_empty_repo_has_no_confident_detection(tmp_path: Path) -> None:
+    profile = build_project_profile(tmp_path).to_dict()
+
+    assert profile["languages"] == []
+    assert profile["confidence"] == {}
+
+
+def test_build_project_profile_detects_nested_monorepo_project(tmp_path: Path) -> None:
+    nested = tmp_path / "app"
+    nested.mkdir()
+    (nested / "go.mod").write_text("module example.com/app\n", encoding="utf-8")
+
+    profile = build_project_profile(tmp_path).to_dict()
+
+    assert profile["languages"] == ["go"]
+    assert profile["confidence"]["languages"] == 0.7
+
+
+def test_qa_commands_from_profile_only_maps_allowlisted_strings() -> None:
+    commands = qa_commands_from_profile({"test_commands": ["pytest", "rm -rf /", "go test ./..."]})
+
+    assert [sys.executable, "-m", "pytest"] in commands
+    assert ["go", "test", "./..."] in commands
+    assert not any("rm" in " ".join(command) for command in commands)
+
+
+def test_project_profiler_runs_before_triage_and_populates_state(tmp_path: Path) -> None:
+    # Deliberately no "scripts" key -- a "test" script would make qa_gate's
+    # profile-derived fallback later in this same run actually invoke a real
+    # `npm test` subprocess, which this test isn't meant to exercise.
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "package.json").write_text(json.dumps({"name": "fixture-app"}), encoding="utf-8")
+
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    orchestrator = RagnarOrchestrator(
+        registry,
+        config_path=Path("ragnar/ragnar.yaml"),
+        prepare_worktrees=False,
+        record_runs=False,
+    )
+    orchestrator.workspaces = RoleWorkspaceManager(tmp_path, enabled=False)
+
+    state = orchestrator.invoke("fix the login bug")
+
+    assert state["project_profile"]["languages"] == ["javascript"]
+    artifact_kinds = [artifact["kind"] for artifact in state["artifacts"]]
+    assert artifact_kinds.index("project_profile") < artifact_kinds.index("conductor_triage")
+
+
+class _FakeExecutionAdapter:
+    """Records commands instead of ever spawning a real subprocess.
+
+    A real LocalExecutionAdapter running a profile-discovered "pytest" command
+    would invoke sys.executable -m pytest -- the same interpreter already
+    running this test suite -- which risks the child recursively re-collecting
+    and re-running the whole suite. This fake proves the wiring (discovery ->
+    policy gate -> execution.run) without ever spawning anything real.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def run(self, command: list[str]) -> Any:
+        self.calls.append(command)
+        return CommandResult(command=command, cwd=".", exit_code=0, stdout="1 passed", stderr="", timed_out=False)
+
+
+def test_qa_profile_discovery_is_off_by_default() -> None:
+    assert RagnarConfig(version="0.1", raw={}).enable_qa_profile_discovery() is False
+
+
+def test_qa_gate_does_not_run_commands_from_profile_when_discovery_disabled() -> None:
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    orchestrator = RagnarOrchestrator(
+        registry,
+        config_path=Path("ragnar/ragnar.yaml"),
+        prepare_worktrees=False,
+        record_runs=False,
+    )
+    fake_execution = _FakeExecutionAdapter()
+    orchestrator.execution = fake_execution
+    assert orchestrator.config.enable_qa_profile_discovery() is False
+
+    state: Any = {
+        "run_id": "run-qa-discovery-off",
+        "objective": "fix the login bug",
+        "qa_commands": [],
+        "project_profile": {"test_commands": ["pytest"]},
+        "artifacts": [
+            {"kind": "backend_work_packet", "owner_role": "backend_engineer", "created_at": "now", "body": {}}
+        ],
+    }
+    result = orchestrator.qa_gate(state)
+
+    assert fake_execution.calls == []
+    qa_artifact = result["artifacts"][0]
+    assert qa_artifact["body"]["verdict"] == "pass_with_warnings"
+
+
+def test_qa_gate_discovers_and_runs_command_from_project_profile() -> None:
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    orchestrator = RagnarOrchestrator(
+        registry,
+        config_path=Path("ragnar/ragnar.yaml"),
+        prepare_worktrees=False,
+        record_runs=False,
+    )
+    fake_execution = _FakeExecutionAdapter()
+    orchestrator.execution = fake_execution
+    # enable_qa_profile_discovery defaults to false in ragnar.yaml precisely
+    # because auto-running discovered commands is unsafe by default (see the
+    # comment in ragnar.yaml) -- opt in explicitly for this test.
+    orchestrator.config = RagnarConfig(
+        version=orchestrator.config.version,
+        raw={**orchestrator.config.raw, "execution": {**orchestrator.config.raw.get("execution", {}), "enable_qa_profile_discovery": True}},
+    )
+
+    state: Any = {
+        "run_id": "run-qa-discovery",
+        "objective": "fix the login bug",
+        "qa_commands": [],
+        "project_profile": {"test_commands": ["pytest"]},
+        "artifacts": [
+            {"kind": "backend_work_packet", "owner_role": "backend_engineer", "created_at": "now", "body": {}}
+        ],
+    }
+    result = orchestrator.qa_gate(state)
+
+    assert fake_execution.calls == [[sys.executable, "-m", "pytest"]]
+    qa_artifact = result["artifacts"][0]
+    assert qa_artifact["body"]["verdict"] == "pass"
+    assert "discovered from the project profile" in " ".join(qa_artifact["body"]["warnings"])

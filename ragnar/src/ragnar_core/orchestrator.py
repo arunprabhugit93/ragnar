@@ -29,6 +29,7 @@ from .execution import LocalExecutionAdapter
 from .memory_writeback import MemoryWritebackStore, default_writeback_path
 from .observability import RunRecorder, default_runs_path
 from .pr_adapter import PullRequestDraftStore, build_pr_draft, default_pr_draft_dir
+from .project_profiler import build_project_profile, qa_commands_from_profile
 from .role_runtime import RoleRuntime, RoleRuntimeMode, default_manifest_path, extract_json_object
 from .role_registry import RoleContract, RoleRegistry, load_role_registry
 from .workspace import RoleWorkspaceManager
@@ -65,6 +66,7 @@ class RagnarState(TypedDict, total=False):
     qa_rework_roles: list[str]
     qa_revision_count: int
     owner_briefing: str
+    project_profile: dict[str, Any]
 
 
 def _repo_root() -> Path:
@@ -161,6 +163,7 @@ class RagnarOrchestrator:
 
         graph = StateGraph(RagnarState)
         graph.add_node("intake_objective", self.intake_objective)
+        graph.add_node("project_profiler", self.project_profiler)
         graph.add_node("conductor_triage", self.conductor_triage)
         graph.add_node("architect_plan", self.architect_plan)
         graph.add_node("conductor_review_plan", self.conductor_review_plan)
@@ -175,7 +178,8 @@ class RagnarOrchestrator:
         graph.add_node("final_report", self.final_report)
 
         graph.add_edge(START, "intake_objective")
-        graph.add_edge("intake_objective", "conductor_triage")
+        graph.add_edge("intake_objective", "project_profiler")
+        graph.add_edge("project_profiler", "conductor_triage")
         graph.add_edge("conductor_triage", "architect_plan")
         graph.add_edge("architect_plan", "conductor_review_plan")
         graph.add_conditional_edges(
@@ -273,6 +277,23 @@ class RagnarOrchestrator:
         return {
             "phase": "intake",
             "audit_events": [_event("intake_objective", "accepted owner objective", objective=objective)],
+        }
+
+    def project_profiler(self, state: RagnarState) -> dict[str, Any]:
+        root = self.workspaces.git_root() or _repo_root()
+        profile = build_project_profile(root).to_dict()
+        return {
+            "phase": "profiled",
+            "project_profile": profile,
+            "artifacts": [_artifact("project_profile", "conductor", profile)],
+            "audit_events": [
+                _event(
+                    "project_profiler",
+                    "detected project profile",
+                    languages=profile["languages"],
+                    frameworks=profile["frameworks"],
+                )
+            ],
         }
 
     def conductor_triage(self, state: RagnarState) -> dict[str, Any]:
@@ -412,9 +433,14 @@ class RagnarOrchestrator:
         if decision.decision is not Decision.ALLOW:
             raise RuntimeError(f"QA gate is not allowed: {decision.reason}")
         build_packets = [artifact for artifact in state.get("artifacts", []) if artifact["kind"].endswith("_work_packet")]
+        qa_commands = state.get("qa_commands", [])
+        commands_from_profile = False
+        if not qa_commands and self.config.enable_qa_profile_discovery():
+            qa_commands = qa_commands_from_profile(state.get("project_profile", {}))
+            commands_from_profile = bool(qa_commands)
         command_results = []
         denied_commands = []
-        for command in state.get("qa_commands", []):
+        for command in qa_commands:
             command_check = self.workspaces.check_command(qa.role_id, command)
             if not command_check.allowed:
                 denied_commands.append({"command": command, "policy": command_check.to_dict()})
@@ -430,6 +456,8 @@ class RagnarOrchestrator:
         warnings = []
         if not command_results:
             warnings.append("No real QA command was configured for this run.")
+        elif commands_from_profile:
+            warnings.append("QA commands were discovered from the project profile, not explicitly configured.")
 
         # The deterministic verdict above is ground truth from real exit codes and stays
         # authoritative. This adds a narrative reasoning layer on top of it -- QA's agent
@@ -454,6 +482,7 @@ class RagnarOrchestrator:
             policy=policy,
             memory_context=role_context
             + [{"scope": "observed_facts", "namespace": None, "query": {}, "hits": [observed_facts], "errors": []}],
+            project_profile=state.get("project_profile"),
         )
         runtime_result = self.role_runtime.run(
             qa, state["objective"], "produce_qa_verdict", role_context, invocation=invocation
@@ -677,6 +706,7 @@ class RagnarOrchestrator:
                     "what happened, what (if anything) needs their decision, and any risks flagged during review.",
                 ],
             },
+            project_profile=state.get("project_profile"),
         )
         runtime_result = self.role_runtime.run(
             conductor, state["objective"], "summarize_status", memory_context, invocation=invocation
@@ -838,6 +868,7 @@ class RagnarOrchestrator:
             policy=policy,
             memory_context=role_context,
             rework_feedback=rework_feedback,
+            project_profile=state.get("project_profile"),
         )
         runtime_result = self.role_runtime.run(role, state["objective"], action, role_context, invocation=invocation)
         if runtime_result.raw_reply is not None:
@@ -982,6 +1013,7 @@ class RagnarOrchestrator:
             policy=policy,
             memory_context=memory_context,
             expected_output_schema=expected_review_output_schema(),
+            project_profile=state.get("project_profile"),
         )
         runtime_result = self.role_runtime.run(
             conductor, state["objective"], action, memory_context, invocation=invocation
