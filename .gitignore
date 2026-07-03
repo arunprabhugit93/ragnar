@@ -41,3 +41,6 @@ ragnar/.ragnar/pr_drafts/
 *.log
 *.sqlite
 *.sqlite3
+
+# Vendored reference repos (cloned separately, not part of this project's history)
+vendor/
