@@ -9,6 +9,8 @@ dependencies = [
   "fastembed>=0.7.0",
   "psycopg[binary]>=3.2.0",
   "mcp>=1.12.0",
+  "langgraph>=1.0.0",
+  "langgraph-checkpoint-sqlite>=3.1.0",
 ]
 
 [project.scripts]
@@ -17,6 +19,7 @@ ragnar-provision-letta = "ragnar_core.letta_provisioner:main"
 ragnar-bootstrap-memory = "ragnar_core.memory_bootstrap:main"
 ragnar-rag-memory = "ragnar_core.rag_memory:main"
 ragnar-graphiti-memory = "ragnar_core.graphiti_memory:main"
+ragnar-orchestrate = "ragnar_core.orchestrator:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

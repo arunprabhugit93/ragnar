@@ -24,6 +24,8 @@ node_modules/
 .env.*.local
 
 # Runtime data
-.matron/runtime/
-.matron/logs/
+.ragnar/runtime/
+.ragnar/logs/
 *.log
+*.sqlite
+*.sqlite3
