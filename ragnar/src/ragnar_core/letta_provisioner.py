@@ -29,11 +29,11 @@ def _repo_root() -> Path:
 
 
 def _default_roles_path() -> Path:
-    return _repo_root() / "roles" / "matron_roles.yaml"
+    return _repo_root() / "roles" / "ragnar_roles.yaml"
 
 
 def _default_manifest_path() -> Path:
-    return _repo_root() / ".matron" / "letta_agents.json"
+    return _repo_root() / ".ragnar" / "letta_agents.json"
 
 
 def _client(base_url: str, api_key: str | None) -> Any:
@@ -41,7 +41,7 @@ def _client(base_url: str, api_key: str | None) -> Any:
         from letta_client import Letta
     except ImportError as exc:
         raise RuntimeError(
-            "Missing dependency: letta-client. Install with `pip install -e .` from the matron directory."
+            "Missing dependency: letta-client. Install with `pip install -e .` from the ragnar directory."
         ) from exc
 
     if api_key:
@@ -60,7 +60,7 @@ def _role_instructions(role: RoleContract) -> str:
     receives = "\n".join(f"- {item}" for item in role.handoffs.get("receives_from", [])) or "- none"
     sends = "\n".join(f"- {item}" for item in role.handoffs.get("sends_to", [])) or "- none"
 
-    return f"""You are a durable Matron role instance.
+    return f"""You are a durable Ragnar role instance.
 
 Role ID: {role.role_id}
 Display label: {role.display_name}
@@ -140,7 +140,7 @@ def _memory_blocks(role: RoleContract) -> list[dict[str, Any]]:
 
 def _tags(role: RoleContract) -> list[str]:
     return [
-        "matron",
+        "ragnar",
         f"role:{role.role_id}",
         f"team:{role.team}",
         f"memory:{role.private_memory_namespace}",
@@ -203,13 +203,13 @@ def create_or_reuse_agents(
 
         payload: dict[str, Any] = {
             "agent_type": "letta_v1_agent",
-            "name": f"matron__{role.role_id}",
+            "name": f"ragnar__{role.role_id}",
             "memory_blocks": _memory_blocks(role),
             "tags": _tags(role),
             "model": model,
             "embedding": embedding,
             "metadata": {
-                "system": "matron",
+                "system": "ragnar",
                 "role_id": role.role_id,
                 "team": role.team,
                 "private_memory_namespace": role.private_memory_namespace,
@@ -247,13 +247,13 @@ def create_or_reuse_agents(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Provision durable Letta agents for Matron roles")
+    parser = argparse.ArgumentParser(description="Provision durable Letta agents for Ragnar roles")
     parser.add_argument("--roles", type=Path, default=_default_roles_path())
     parser.add_argument("--manifest", type=Path, default=_default_manifest_path())
     parser.add_argument("--base-url", default=os.getenv("LETTA_SERVER_URL", "http://localhost:8283"))
     parser.add_argument("--api-key", default=os.getenv("LETTA_API_KEY"))
-    parser.add_argument("--model", default=os.getenv("MATRON_LETTA_MODEL", DEFAULT_MODEL))
-    parser.add_argument("--embedding", default=os.getenv("MATRON_LETTA_EMBEDDING", DEFAULT_EMBEDDING))
+    parser.add_argument("--model", default=os.getenv("RAGNAR_LETTA_MODEL", DEFAULT_MODEL))
+    parser.add_argument("--embedding", default=os.getenv("RAGNAR_LETTA_EMBEDDING", DEFAULT_EMBEDDING))
     parser.add_argument(
         "--no-communication-tools",
         action="store_true",

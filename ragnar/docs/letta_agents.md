@@ -1,17 +1,17 @@
 # Durable Letta Role Agents
 
-`matron_core.letta_provisioner` turns every role in `roles/matron_roles.yaml` into a durable Letta agent.
+`ragnar_core.letta_provisioner` turns every role in `roles/ragnar_roles.yaml` into a durable Letta agent.
 
 ## Provisioning Command
 
-From the `matron/` directory:
+From the `ragnar/` directory:
 
 ```bash
 pip install -e .
 export LETTA_SERVER_URL=http://localhost:8283
 # export LETTA_API_KEY=... # only when your Letta server requires it
 
-matron-provision-letta
+ragnar-provision-letta
 ```
 
 If you want to use the cloned Letta repo locally, start it separately from:
@@ -21,18 +21,18 @@ cd ../vendor/letta
 docker compose up
 ```
 
-Then return to `matron/` and run `matron-provision-letta`.
+Then return to `ragnar/` and run `ragnar-provision-letta`.
 
 Dry run:
 
 ```bash
-PYTHONPATH=src python3 -m matron_core.letta_provisioner --dry-run
+PYTHONPATH=src python3 -m ragnar_core.letta_provisioner --dry-run
 ```
 
 The command writes the created Letta IDs to:
 
 ```text
-matron/.matron/letta_agents.json
+ragnar/.ragnar/letta_agents.json
 ```
 
 The manifest is used to avoid creating duplicate agents on repeated runs.
@@ -42,10 +42,10 @@ The manifest is used to avoid creating duplicate agents on repeated runs.
 Each role is created as:
 
 ```text
-name = matron__<role_id>
-tags = matron, role:<role_id>, team:<team>, memory:<private_namespace>
-model = MATRON_LETTA_MODEL or openai/gpt-4o-mini
-embedding = MATRON_LETTA_EMBEDDING or openai/text-embedding-3-small
+name = ragnar__<role_id>
+tags = ragnar, role:<role_id>, team:<team>, memory:<private_namespace>
+model = RAGNAR_LETTA_MODEL or openai/gpt-4o-mini
+embedding = RAGNAR_LETTA_EMBEDDING or openai/text-embedding-3-small
 include_multi_agent_tools = true
 ```
 
@@ -57,7 +57,7 @@ Each role receives four memory blocks:
 
 2. `role_contract`
    - Read-only.
-   - JSON copy of the role contract from `matron_roles.yaml`.
+   - JSON copy of the role contract from `ragnar_roles.yaml`.
 
 3. `memory_scope`
    - Read-only.
@@ -77,7 +77,7 @@ Provisioned roles include Letta multi-agent tools, and are tagged by role and te
 - conductor-to-specialist dispatch
 - QA feedback back to engineer roles
 
-The Matron handoff protocol still needs to wrap this so messages are typed artifacts, not loose chat.
+The Ragnar handoff protocol still needs to wrap this so messages are typed artifacts, not loose chat.
 
 ## Self-Training Model
 

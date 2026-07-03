@@ -1,8 +1,8 @@
-# Matron Foundation
+# Ragnar Foundation
 
 This folder is the first shape of the governed AI delivery crew.
 
-The cloned repositories in `vendor/` are reference/building-block projects. The Matron engine itself lives under `matron/` and should stay role-contract driven rather than agent-name driven.
+The cloned repositories in `vendor/` are reference/building-block projects. The Ragnar engine itself lives under `ragnar/` and should stay role-contract driven rather than agent-name driven.
 
 ## Cloned Building Blocks
 
@@ -16,7 +16,7 @@ The cloned repositories in `vendor/` are reference/building-block projects. The 
 
 ## Core Design
 
-Matron should model:
+Ragnar should model:
 
 ```text
 Role Contract -> Runtime Agent Instance -> Memory Scope -> Tool Scope -> Permission Scope -> Handoff Protocol

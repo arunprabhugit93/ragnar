@@ -1,6 +1,6 @@
-# Matron Graphiti Memory
+# Ragnar Graphiti Memory
 
-Graphiti adds temporal graph memory beside Matron's pgvector RAG memory.
+Graphiti adds temporal graph memory beside Ragnar's pgvector RAG memory.
 
 Use pgvector for chunk retrieval:
 
@@ -18,11 +18,11 @@ Use Graphiti for graph-shaped, time-aware facts:
 
 ## Start Graphiti
 
-The Matron compose file avoids the local Redis port conflict by exposing FalkorDB on host port `6380`.
+The Ragnar compose file avoids the local Redis port conflict by exposing FalkorDB on host port `6380`.
 
 ```sh
 cd vendor/graphiti/mcp_server
-docker compose -f docker/docker-compose-matron.yml up -d falkordb graphiti-mcp
+docker compose -f docker/docker-compose-ragnar.yml up -d falkordb graphiti-mcp
 ```
 
 Endpoints:
@@ -47,19 +47,19 @@ MODEL_NAME=gpt-4.1-mini
 EMBEDDER_MODEL=text-embedding-3-small
 ```
 
-The file already sets non-secret Matron defaults: `GRAPHITI_GROUP_ID=matron`, `FALKORDB_DATABASE=matron`, and `SEMAPHORE_LIMIT=2`.
+The file already sets non-secret Ragnar defaults: `GRAPHITI_GROUP_ID=ragnar`, `FALKORDB_DATABASE=ragnar`, and `SEMAPHORE_LIMIT=2`.
 
 ## Seed Role Graph
 
 ```sh
-cd matron
+cd ragnar
 . .venv/bin/activate
 pip install -e .
-matron-graphiti-memory status
-matron-graphiti-memory seed-roles
+ragnar-graphiti-memory status
+ragnar-graphiti-memory seed-roles
 ```
 
-This queues one role-contract episode per Matron role and writes direct graph triplets for:
+This queues one role-contract episode per Ragnar role and writes direct graph triplets for:
 
 - role -> private memory namespace
 - role -> shared memory namespaces
@@ -69,8 +69,8 @@ This queues one role-contract episode per Matron role and writes direct graph tr
 ## Search
 
 ```sh
-matron-graphiti-memory search-facts "who can receive backend engineer handoffs"
-matron-graphiti-memory search-nodes "qa findings and ship verdicts"
+ragnar-graphiti-memory search-facts "who can receive backend engineer handoffs"
+ragnar-graphiti-memory search-nodes "qa findings and ship verdicts"
 ```
 
 ## How This Fits

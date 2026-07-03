@@ -14,7 +14,7 @@ from .role_registry import RoleContract, load_role_registry
 
 
 DEFAULT_MCP_URL = "http://127.0.0.1:8000/mcp/"
-DEFAULT_GROUP_ID = "matron"
+DEFAULT_GROUP_ID = "ragnar"
 
 
 def _repo_root() -> Path:
@@ -22,7 +22,7 @@ def _repo_root() -> Path:
 
 
 def _default_roles_path() -> Path:
-    return _repo_root() / "roles" / "matron_roles.yaml"
+    return _repo_root() / "roles" / "ragnar_roles.yaml"
 
 
 def _episode_for_role(role: RoleContract) -> dict[str, Any]:
@@ -116,7 +116,7 @@ class GraphitiClient:
             from mcp import ClientSession
             from mcp.client.streamable_http import streamablehttp_client
         except ImportError as exc:
-            raise RuntimeError("Missing dependency: mcp. Run `pip install -e .` from the matron directory.") from exc
+            raise RuntimeError("Missing dependency: mcp. Run `pip install -e .` from the ragnar directory.") from exc
 
         self._check_ready()
         async with streamablehttp_client(self.url) as (read_stream, write_stream, _):
@@ -148,13 +148,13 @@ async def _seed_roles(url: str, group_id: str, roles_path: Path, use_triplets: b
         await client.call_tool(
             "add_memory",
             {
-                "name": f"Matron role contract: {role.role_id}",
+                "name": f"Ragnar role contract: {role.role_id}",
                 "episode_body": json.dumps(episode, indent=2),
                 "group_id": group_id,
                 "source": "json",
-                "source_description": "Matron role registry",
+                "source_description": "Ragnar role registry",
                 "reference_time": now,
-                "saga": "matron-role-contracts",
+                "saga": "ragnar-role-contracts",
                 "custom_extraction_instructions": (
                     "Extract role ownership, responsibilities, permissions, memory namespaces, "
                     "and handoff relationships. Preserve role_id and namespace names exactly."
@@ -190,9 +190,9 @@ def _print_result(result: Any) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Matron Graphiti temporal memory bridge.")
-    parser.add_argument("--url", default=os.environ.get("MATRON_GRAPHITI_MCP_URL", DEFAULT_MCP_URL))
-    parser.add_argument("--group-id", default=os.environ.get("MATRON_GRAPHITI_GROUP_ID", DEFAULT_GROUP_ID))
+    parser = argparse.ArgumentParser(description="Ragnar Graphiti temporal memory bridge.")
+    parser.add_argument("--url", default=os.environ.get("RAGNAR_GRAPHITI_MCP_URL", DEFAULT_MCP_URL))
+    parser.add_argument("--group-id", default=os.environ.get("RAGNAR_GRAPHITI_GROUP_ID", DEFAULT_GROUP_ID))
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("status")

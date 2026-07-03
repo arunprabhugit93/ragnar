@@ -8,11 +8,11 @@ from .role_registry import load_role_registry
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Inspect Matron role contracts")
+    parser = argparse.ArgumentParser(description="Inspect Ragnar role contracts")
     parser.add_argument(
         "--roles",
-        default=str(Path(__file__).resolve().parents[2] / "roles" / "matron_roles.yaml"),
-        help="Path to matron_roles.yaml",
+        default=str(Path(__file__).resolve().parents[2] / "roles" / "ragnar_roles.yaml"),
+        help="Path to ragnar_roles.yaml",
     )
     parser.add_argument("--check-action", nargs=2, metavar=("ROLE_ID", "ACTION"))
     args = parser.parse_args()

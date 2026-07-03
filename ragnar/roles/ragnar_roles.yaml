@@ -7,7 +7,7 @@ principles:
 
 roles:
   - role_id: conductor
-    display_name: Matron
+    display_name: Ragnar
     team: conductor
     responsibility:
       - Hold the single source of truth across projects.

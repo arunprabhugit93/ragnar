@@ -8,7 +8,7 @@ services:
       - FALKORDB_PASSWORD=${FALKORDB_PASSWORD:-}
       - BROWSER=${BROWSER:-1}
     volumes:
-      - matron_falkordb_data:/var/lib/falkordb/data
+      - ragnar_falkordb_data:/var/lib/falkordb/data
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "6379", "ping"]
       interval: 10s
@@ -30,8 +30,8 @@ services:
     environment:
       - FALKORDB_URI=${FALKORDB_URI:-redis://falkordb:6379}
       - FALKORDB_PASSWORD=${FALKORDB_PASSWORD:-}
-      - FALKORDB_DATABASE=${FALKORDB_DATABASE:-matron}
-      - GRAPHITI_GROUP_ID=${GRAPHITI_GROUP_ID:-matron}
+      - FALKORDB_DATABASE=${FALKORDB_DATABASE:-ragnar}
+      - GRAPHITI_GROUP_ID=${GRAPHITI_GROUP_ID:-ragnar}
       - SEMAPHORE_LIMIT=${SEMAPHORE_LIMIT:-2}
       - CONFIG_PATH=/app/mcp/config/config.yaml
       - PATH=/root/.local/bin:${PATH}
@@ -42,5 +42,5 @@ services:
     command: ["uv", "run", "--no-sync", "main.py"]
 
 volumes:
-  matron_falkordb_data:
+  ragnar_falkordb_data:
     driver: local

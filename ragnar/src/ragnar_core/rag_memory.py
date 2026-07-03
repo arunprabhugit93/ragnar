@@ -15,7 +15,7 @@ from .role_registry import RoleContract, load_role_registry
 DEFAULT_DB_URL = "postgresql://letta:letta@localhost:55432/letta"
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 EMBEDDING_DIMENSIONS = 384
-BOOTSTRAP_VERSION = "matron-rag-memory/v1"
+BOOTSTRAP_VERSION = "ragnar-rag-memory/v1"
 
 
 @dataclass(frozen=True)
@@ -33,14 +33,14 @@ def _repo_root() -> Path:
 
 
 def _default_roles_path() -> Path:
-    return _repo_root() / "roles" / "matron_roles.yaml"
+    return _repo_root() / "roles" / "ragnar_roles.yaml"
 
 
 def _embedder(model_name: str) -> Any:
     try:
         from fastembed import TextEmbedding
     except ImportError as exc:
-        raise RuntimeError("Missing dependency: fastembed. Run `pip install -e .` from the matron directory.") from exc
+        raise RuntimeError("Missing dependency: fastembed. Run `pip install -e .` from the ragnar directory.") from exc
     return TextEmbedding(model_name=model_name)
 
 
@@ -48,7 +48,7 @@ def _connect(db_url: str) -> Any:
     try:
         import psycopg
     except ImportError as exc:
-        raise RuntimeError("Missing dependency: psycopg. Run `pip install -e .` from the matron directory.") from exc
+        raise RuntimeError("Missing dependency: psycopg. Run `pip install -e .` from the ragnar directory.") from exc
     return psycopg.connect(db_url)
 
 
@@ -70,7 +70,7 @@ def ensure_schema(db_url: str) -> None:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
             cur.execute(
                 f"""
-                CREATE TABLE IF NOT EXISTS matron_memory_passages (
+                CREATE TABLE IF NOT EXISTS ragnar_memory_passages (
                     id uuid PRIMARY KEY,
                     fingerprint text NOT NULL UNIQUE,
                     namespace text NOT NULL,
@@ -85,12 +85,12 @@ def ensure_schema(db_url: str) -> None:
                 )
                 """
             )
-            cur.execute("CREATE INDEX IF NOT EXISTS matron_memory_namespace_idx ON matron_memory_passages (namespace)")
-            cur.execute("CREATE INDEX IF NOT EXISTS matron_memory_owner_role_idx ON matron_memory_passages (owner_role)")
+            cur.execute("CREATE INDEX IF NOT EXISTS ragnar_memory_namespace_idx ON ragnar_memory_passages (namespace)")
+            cur.execute("CREATE INDEX IF NOT EXISTS ragnar_memory_owner_role_idx ON ragnar_memory_passages (owner_role)")
             cur.execute(
                 """
-                CREATE INDEX IF NOT EXISTS matron_memory_embedding_hnsw_idx
-                ON matron_memory_passages USING hnsw (embedding vector_cosine_ops)
+                CREATE INDEX IF NOT EXISTS ragnar_memory_embedding_hnsw_idx
+                ON ragnar_memory_passages USING hnsw (embedding vector_cosine_ops)
                 """
             )
 
@@ -105,7 +105,7 @@ def upsert_records(db_url: str, model_name: str, records: list[MemoryRecord]) ->
             for record, embedding in zip(records, embeddings):
                 cur.execute(
                     """
-                    INSERT INTO matron_memory_passages (
+                    INSERT INTO ragnar_memory_passages (
                         id, fingerprint, namespace, scope, owner_role, text, tags, metadata, embedding
                     )
                     VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::vector)
@@ -155,7 +155,7 @@ def search_records(
             cur.execute(
                 f"""
                 SELECT namespace, scope, owner_role, text, tags, metadata, 1 - (embedding <=> %s::vector) AS score
-                FROM matron_memory_passages
+                FROM ragnar_memory_passages
                 {where}
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
@@ -200,7 +200,7 @@ def _role_record(role: RoleContract) -> MemoryRecord:
         scope="private",
         owner_role=role.role_id,
         text=text,
-        tags=["matron", BOOTSTRAP_VERSION, "role_contract", f"role:{role.role_id}", f"team:{role.team}"],
+        tags=["ragnar", BOOTSTRAP_VERSION, "role_contract", f"role:{role.role_id}", f"team:{role.team}"],
         metadata={"bootstrap_version": BOOTSTRAP_VERSION, "role_id": role.role_id},
     )
 
@@ -231,7 +231,7 @@ def _shared_records(roles: list[RoleContract]) -> list[MemoryRecord]:
                 scope="shared",
                 owner_role=None,
                 text=text,
-                tags=["matron", BOOTSTRAP_VERSION, "shared_namespace", f"namespace:{namespace}"],
+                tags=["ragnar", BOOTSTRAP_VERSION, "shared_namespace", f"namespace:{namespace}"],
                 metadata={"bootstrap_version": BOOTSTRAP_VERSION, "attached_roles": role_ids},
             )
         )
@@ -244,9 +244,9 @@ def bootstrap(db_url: str, model_name: str, roles_path: Path) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Matron local RAG memory backed by pgvector and local embeddings.")
-    parser.add_argument("--db-url", default=os.environ.get("MATRON_MEMORY_DB_URL", DEFAULT_DB_URL))
-    parser.add_argument("--embedding-model", default=os.environ.get("MATRON_MEMORY_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL))
+    parser = argparse.ArgumentParser(description="Ragnar local RAG memory backed by pgvector and local embeddings.")
+    parser.add_argument("--db-url", default=os.environ.get("RAGNAR_MEMORY_DB_URL", DEFAULT_DB_URL))
+    parser.add_argument("--embedding-model", default=os.environ.get("RAGNAR_MEMORY_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL))
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     bootstrap_parser = subparsers.add_parser("bootstrap")

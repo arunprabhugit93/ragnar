@@ -1,6 +1,6 @@
-# Matron Vector Memory
+# Ragnar Vector Memory
 
-Matron uses Letta as the durable agent runtime and memory substrate.
+Ragnar uses Letta as the durable agent runtime and memory substrate.
 
 The memory rule is:
 
@@ -22,21 +22,21 @@ The memory rule is:
 Preferred local bootstrap, with local embeddings and the Letta Docker Postgres `pgvector` extension:
 
 ```sh
-cd matron
+cd ragnar
 . .venv/bin/activate
-matron-rag-memory bootstrap
-matron-rag-memory search "backend database migration lessons" --role backend_engineer
+ragnar-rag-memory bootstrap
+ragnar-rag-memory search "backend database migration lessons" --role backend_engineer
 ```
 
 Letta archival-memory bootstrap, once the Letta container has a working embedding provider such as OpenAI or Ollama:
 
 ```sh
-cd matron
+cd ragnar
 . .venv/bin/activate
-matron-bootstrap-memory --base-url http://127.0.0.1:8283
+ragnar-bootstrap-memory --base-url http://127.0.0.1:8283
 ```
 
-`matron-rag-memory` writes to a Matron-owned vector table in the same Postgres server. `matron-bootstrap-memory` writes into Letta's own archival memory and shared archives.
+`ragnar-rag-memory` writes to a Ragnar-owned vector table in the same Postgres server. `ragnar-bootstrap-memory` writes into Letta's own archival memory and shared archives.
 
 ## Recommended Retrieval Flow
 

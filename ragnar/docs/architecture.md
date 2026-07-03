@@ -1,10 +1,10 @@
-# Matron Architecture
+# Ragnar Architecture
 
 ## Runtime Layers
 
 1. Role Registry
    - Defines responsibilities, memory scopes, tool scopes, permissions, and handoff contracts.
-   - Source: `matron/roles/matron_roles.yaml`.
+   - Source: `ragnar/roles/ragnar_roles.yaml`.
 
 2. Orchestration Runtime
    - Use LangGraph as the first workflow spine.

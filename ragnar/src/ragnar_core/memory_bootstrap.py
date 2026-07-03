@@ -28,17 +28,17 @@ def _repo_root() -> Path:
 
 
 def _default_roles_path() -> Path:
-    return _repo_root() / "roles" / "matron_roles.yaml"
+    return _repo_root() / "roles" / "ragnar_roles.yaml"
 
 
 def _default_manifest_path() -> Path:
-    return _repo_root() / ".matron" / "letta_agents.json"
+    return _repo_root() / ".ragnar" / "letta_agents.json"
 
 
 def _load_manifest(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(
-            f"Missing Letta agent manifest: {path}. Run `matron-provision-letta` before bootstrapping memory."
+            f"Missing Letta agent manifest: {path}. Run `ragnar-provision-letta` before bootstrapping memory."
         )
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -50,7 +50,7 @@ def _save_manifest(path: Path, manifest: dict[str, Any]) -> None:
 
 def _archive_name(namespace: str) -> str:
     safe = namespace.replace("/", "__").replace(" ", "_")
-    return f"matron__shared__{safe}"
+    return f"ragnar__shared__{safe}"
 
 
 def _page_items(page: Any) -> list[Any]:
@@ -75,7 +75,7 @@ def _agent_id(manifest: dict[str, Any], role: RoleContract) -> str:
     try:
         return str(manifest["agents"][role.role_id]["letta_agent_id"])
     except KeyError as exc:
-        raise KeyError(f"Manifest has no Letta agent for role {role.role_id}. Re-run matron-provision-letta.") from exc
+        raise KeyError(f"Manifest has no Letta agent for role {role.role_id}. Re-run ragnar-provision-letta.") from exc
 
 
 def _role_seed_text(role: RoleContract) -> str:
@@ -108,7 +108,7 @@ def _shared_seed_text(namespace: str, roles: list[RoleContract]) -> str:
             "memory_kind": "shared_namespace_policy",
             "namespace": namespace,
             "attached_roles": [role.role_id for role in roles],
-            "purpose": "Shared vector memory archive for Matron roles that need the same project context without duplicating prompt tokens.",
+            "purpose": "Shared vector memory archive for Ragnar roles that need the same project context without duplicating prompt tokens.",
             "retrieval_policy": [
                 "Search this archive only when the current task needs this namespace.",
                 "Prefer small, source-linked passages over large summaries.",
@@ -139,7 +139,7 @@ def _create_or_reuse_archive(client: Any, manifest: dict[str, Any], namespace: s
     if archive is None:
         archive = client.archives.create(
             name=name,
-            description=f"Matron shared vector memory namespace: {namespace}",
+            description=f"Ragnar shared vector memory namespace: {namespace}",
             embedding=embedding,
         )
 
@@ -177,7 +177,7 @@ def bootstrap_memory(
                 agent_id,
                 text=_role_seed_text(role),
                 tags=[
-                    "matron",
+                    "ragnar",
                     BOOTSTRAP_VERSION,
                     "memory:private",
                     f"role:{role.role_id}",
@@ -206,13 +206,13 @@ def bootstrap_memory(
                     archive_id,
                     text=_shared_seed_text(namespace, attached_roles),
                     tags=[
-                        "matron",
+                        "ragnar",
                         BOOTSTRAP_VERSION,
                         "memory:shared",
                         f"namespace:{namespace}",
                     ],
                     metadata={
-                        "system": "matron",
+                        "system": "ragnar",
                         "namespace": namespace,
                         "attached_roles": [role.role_id for role in attached_roles],
                     },
@@ -235,12 +235,12 @@ def bootstrap_memory(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Create Matron vector memories in Letta archival memory and shared archives.")
+    parser = argparse.ArgumentParser(description="Create Ragnar vector memories in Letta archival memory and shared archives.")
     parser.add_argument("--roles", type=Path, default=_default_roles_path())
     parser.add_argument("--manifest", type=Path, default=_default_manifest_path())
     parser.add_argument("--base-url", default=os.environ.get("LETTA_BASE_URL", "http://localhost:8283"))
     parser.add_argument("--api-key", default=os.environ.get("LETTA_API_KEY"))
-    parser.add_argument("--embedding", default=os.environ.get("MATRON_LETTA_EMBEDDING", DEFAULT_EMBEDDING))
+    parser.add_argument("--embedding", default=os.environ.get("RAGNAR_LETTA_EMBEDDING", DEFAULT_EMBEDDING))
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 

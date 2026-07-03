@@ -1,6 +1,6 @@
 # Adapter Boundary
 
-Adapters isolate Matron from third-party frameworks.
+Adapters isolate Ragnar from third-party frameworks.
 
 Planned adapters:
 

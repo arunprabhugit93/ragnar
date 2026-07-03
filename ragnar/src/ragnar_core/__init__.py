@@ -1,4 +1,4 @@
-"""Matron core primitives."""
+"""Ragnar core primitives."""
 
 from .role_registry import RoleContract, RoleRegistry, load_role_registry
 
