@@ -21,6 +21,7 @@ ragnar-rag-memory = "ragnar_core.rag_memory:main"
 ragnar-graphiti-memory = "ragnar_core.graphiti_memory:main"
 ragnar-orchestrate = "ragnar_core.orchestrator:main"
 ragnar-approval = "ragnar_core.approvals_cli:main"
+ragnar-workspace = "ragnar_core.workspace_cli:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

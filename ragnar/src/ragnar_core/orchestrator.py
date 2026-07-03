@@ -17,6 +17,7 @@ from .execution import LocalExecutionAdapter
 from .observability import RunRecorder, default_runs_path
 from .role_runtime import RoleRuntime, default_manifest_path
 from .role_registry import RoleContract, RoleRegistry, load_role_registry
+from .workspace import RoleWorkspaceManager, policies_as_dict
 
 
 BuildRole = Literal["backend_engineer", "frontend_engineer", "workflow_engineer"]
@@ -32,6 +33,7 @@ class RagnarState(TypedDict, total=False):
     context_queries: list[dict[str, Any]]
     memory_context: list[dict[str, Any]]
     qa_commands: list[list[str]]
+    workspace_enabled: bool
     artifacts: Annotated[list[dict[str, Any]], operator.add]
     audit_events: Annotated[list[dict[str, Any]], operator.add]
     proposed_actions: Annotated[list[dict[str, Any]], operator.add]
@@ -97,12 +99,14 @@ class RagnarOrchestrator:
         runs_path: Path | None = None,
         manifest_path: Path | None = None,
         record_runs: bool = True,
+        prepare_worktrees: bool = True,
     ) -> None:
         self.registry = registry
         self.approval_broker = ApprovalBroker()
         repo_root = _repo_root()
         self.memory_provider = ContextMemoryProvider(mode=memory_mode)
         self.execution = LocalExecutionAdapter(repo_root)
+        self.workspaces = RoleWorkspaceManager(repo_root, enabled=prepare_worktrees)
         self.role_runtime = RoleRuntime(manifest_path or default_manifest_path(repo_root))
         self.approval_store = ApprovalStore(approvals_path or default_approvals_path(repo_root))
         self.recorder = RunRecorder(runs_path or default_runs_path(repo_root))
@@ -176,6 +180,7 @@ class RagnarOrchestrator:
             "mode": "strict_intelligent",
             "phase": "created",
             "qa_commands": self.qa_commands,
+            "workspace_enabled": self.workspaces.enabled,
         }
         if checkpoint_db is None:
             app = self.build_graph()
@@ -244,7 +249,9 @@ class RagnarOrchestrator:
         plan_steps = [
             "Confirm objective and acceptance criteria.",
             "Retrieve role-private and shared context before execution.",
+            "Prepare isolated role worktrees when Git is available.",
             "Perform role-scoped implementation work only in selected build roles.",
+            "Enforce file-scope and command allowlist policy before execution.",
             "Run QA gate before integration.",
             "Request owner approval for outward actions.",
         ]
@@ -260,10 +267,14 @@ class RagnarOrchestrator:
                         "plan_steps": plan_steps,
                         "acceptance_criteria": [
                             "Every role action must be allowed by its role contract.",
+                            "Every selected build role must receive an isolated workspace report.",
+                            "Role diffs must stay inside the role file-scope policy.",
+                            "Local commands must match the role command allowlist.",
                             "No outward action may be executed without approval.",
                             "QA must produce a verdict before integration.",
                             "Integrator may prepare artifacts but cannot merge or deploy.",
                         ],
+                        "workspace_policy": policies_as_dict(),
                     },
                 )
             ],
@@ -319,9 +330,16 @@ class RagnarOrchestrator:
         if decision.decision is not Decision.ALLOW:
             raise RuntimeError(f"QA gate is not allowed: {decision.reason}")
         build_packets = [artifact for artifact in state.get("artifacts", []) if artifact["kind"].endswith("_work_packet")]
-        command_results = [self.execution.run(command).to_dict() for command in state.get("qa_commands", [])]
+        command_results = []
+        denied_commands = []
+        for command in state.get("qa_commands", []):
+            command_check = self.workspaces.check_command(qa.role_id, command)
+            if not command_check.allowed:
+                denied_commands.append({"command": command, "policy": command_check.to_dict()})
+                continue
+            command_results.append(self.execution.run(command).to_dict())
         command_failed = any(result["exit_code"] != 0 for result in command_results)
-        if command_failed or not build_packets:
+        if command_failed or denied_commands or not build_packets:
             verdict = "fail"
         elif command_results:
             verdict = "pass"
@@ -340,6 +358,7 @@ class RagnarOrchestrator:
                         "verdict": verdict,
                         "reviewed_artifacts": [artifact["kind"] for artifact in build_packets],
                         "commands": command_results,
+                        "denied_commands": denied_commands,
                         "warnings": warnings,
                     },
                 )
@@ -352,6 +371,8 @@ class RagnarOrchestrator:
         draft_decision = self.approval_broker.decide(integrator, "open_pull_request_draft")
         if draft_decision.decision is not Decision.ALLOW:
             raise RuntimeError(f"Integrator cannot prepare PR draft: {draft_decision.reason}")
+        selected_roles = state.get("selected_build_roles", [])
+        diff_reports = [self.workspaces.diff(state["run_id"], role_id).to_dict() for role_id in selected_roles]
         return {
             "phase": "integration_prepared",
             "artifacts": [
@@ -361,6 +382,8 @@ class RagnarOrchestrator:
                     {
                         "summary": "Prepared integration packet from selected role outputs.",
                         "included_artifacts": [artifact["kind"] for artifact in state.get("artifacts", [])],
+                        "role_diffs": diff_reports,
+                        "workspace_policy_ok": all(report["policy_ok"] for report in diff_reports),
                         "next_outward_action": "open_pull_request",
                     },
                 )
@@ -543,6 +566,8 @@ class RagnarOrchestrator:
             raise RuntimeError(f"{role_id} cannot run {action}: {decision.reason}")
         role_context = self._role_memory_context(state, role)
         runtime_result = self.role_runtime.run(role, state["objective"], action, role_context)
+        workspace_report = self.workspaces.prepare(state["run_id"], role_id)
+        diff_report = self.workspaces.diff(state["run_id"], role_id) if workspace_report.available else None
         return {
             "phase": f"{role_id}_complete",
             "artifacts": [
@@ -562,6 +587,8 @@ class RagnarOrchestrator:
                         ],
                         "memory_context": role_context,
                         "role_runtime": runtime_result.to_dict(),
+                        "workspace": workspace_report.to_dict(),
+                        "diff": diff_report.to_dict() if diff_report else None,
                         "notes": notes,
                     },
                 )
@@ -588,6 +615,7 @@ def run_objective(
     memory_mode: MemoryMode = "off",
     qa_commands: list[list[str]] | None = None,
     record_runs: bool = False,
+    prepare_worktrees: bool = False,
 ) -> RagnarState:
     registry = load_role_registry(roles_path or _default_roles_path())
     orchestrator = RagnarOrchestrator(
@@ -595,6 +623,7 @@ def run_objective(
         memory_mode=memory_mode,
         qa_commands=qa_commands,
         record_runs=record_runs,
+        prepare_worktrees=prepare_worktrees,
     )
     return orchestrator.invoke(objective, checkpoint_db=checkpoint_db, run_id=run_id)
 
@@ -619,6 +648,7 @@ def main() -> None:
     )
     parser.add_argument("--no-checkpoint", action="store_true", help="Use in-memory checkpoints for this run.")
     parser.add_argument("--no-record-runs", action="store_true", help="Do not write .ragnar/runs observability files.")
+    parser.add_argument("--no-worktrees", action="store_true", help="Do not prepare isolated role Git worktrees.")
     parser.add_argument("--json", action="store_true", help="Print the full graph state as JSON.")
     args = parser.parse_args()
 
@@ -631,6 +661,7 @@ def main() -> None:
         memory_mode=args.memory_mode,
         qa_commands=qa_commands,
         record_runs=not args.no_record_runs,
+        prepare_worktrees=not args.no_worktrees,
     )
     if args.json:
         print(json.dumps(state, indent=2, default=str))

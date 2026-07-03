@@ -27,7 +27,13 @@ node_modules/
 .ragnar/runtime/
 .ragnar/logs/
 .ragnar/runs/
+.ragnar/worktrees/
 .ragnar/approvals.jsonl
+ragnar/.ragnar/runtime/
+ragnar/.ragnar/logs/
+ragnar/.ragnar/runs/
+ragnar/.ragnar/worktrees/
+ragnar/.ragnar/approvals.jsonl
 *.log
 *.sqlite
 *.sqlite3
