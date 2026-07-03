@@ -10,7 +10,7 @@ from typing import Any
 from ragnar_core.agent_transcripts import AgentTranscriptStore
 from ragnar_core.chat import ChatSession, render_state
 from ragnar_core.config import ModelConfig, RagnarConfig, load_config
-from ragnar_core.contracts import build_invocation_contract
+from ragnar_core.contracts import agent_result_from_reply, build_invocation_contract
 from ragnar_core.edit_adapter import SafePatchAdapter, extract_changed_files
 from ragnar_core.letta_provisioner import (
     ROLE_AGENT_DEFINITION_VERSION,
@@ -75,8 +75,8 @@ def test_orchestrator_routes_all_build_roles() -> None:
         "frontend_engineer",
         "workflow_engineer",
     ]
-    assert state["blocked"] is True
-    assert state["approval_requests"][0]["action"] == "open_pull_request"
+    assert state["blocked"] is False
+    assert state.get("approval_requests", []) == []
 
 
 def test_orchestrator_uses_backend_default_and_keeps_qa_gate() -> None:
@@ -86,7 +86,7 @@ def test_orchestrator_uses_backend_default_and_keeps_qa_gate() -> None:
     assert state["selected_build_roles"] == ["backend_engineer"]
     assert "backend_work_packet" in artifact_kinds
     assert "qa_verdict" in artifact_kinds
-    assert state["phase"] == "awaiting_owner_approval"
+    assert state["phase"] == "approved_to_finish"
 
 
 def test_orchestrator_runs_configured_qa_command() -> None:
@@ -239,7 +239,7 @@ def test_chat_session_runs_objective_once() -> None:
     output = session.run_objective("build dashboard UI")
 
     assert "roles: frontend_engineer" in output
-    assert "approval required:" in output
+    assert "approval required:" not in output
     assert session.last_run_id is not None
 
 
@@ -417,7 +417,7 @@ def _build_test_invocation(role_id: str):
     return build_invocation_contract(
         run_id="run-test",
         objective="test objective",
-        action="draft_migrations",
+        action="edit_backend_worktree",
         role=role,
         model=ModelConfig(provider="openrouter", model="openrouter/x/y", temperature=0.1, max_tokens=100),
         workspace={"available": False},
@@ -481,7 +481,7 @@ def test_call_agent_omits_peer_block_when_disabled() -> None:
 
 def test_agent_transcript_store_appends_and_filters_by_run_id(tmp_path: Path) -> None:
     store = AgentTranscriptStore(tmp_path / "agent_transcripts.jsonl")
-    store.append("run-1", "backend_engineer", "draft_migrations", {"agent_id": "a1", "max_steps": 7, "messages": []})
+    store.append("run-1", "backend_engineer", "edit_backend_worktree", {"agent_id": "a1", "max_steps": 7, "messages": []})
     store.append("run-2", "qa_engineer", "produce_qa_verdict", {"agent_id": "a2", "max_steps": 7, "messages": []})
 
     all_records = store.list()
@@ -500,6 +500,51 @@ def test_revision_caps_configurable_via_ragnar_config() -> None:
     default_config = RagnarConfig(version="0.1", raw={})
     assert default_config.max_plan_revisions(default=MAX_PLAN_REVISIONS) == MAX_PLAN_REVISIONS
     assert default_config.max_qa_revisions(default=2) == 2
+
+
+def test_live_reply_push_branch_without_patch_is_blocked() -> None:
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    role = registry.get("backend_engineer")
+    reply = json.dumps(
+        {
+            "run_id": "run-test",
+            "role_id": "backend_engineer",
+            "status": "proposed",
+            "summary": "Proposed implementation.",
+            "proposed_patches": [],
+            "handoffs": [],
+            "memory_writebacks": [],
+            "proposed_actions": [{"action": "push_branch", "details": "push it"}],
+        }
+    )
+
+    result = agent_result_from_reply("run-test", role, "backend_work_packet", reply)
+
+    assert result.status == "blocked"
+    assert result.proposed_actions == []
+    assert "outward action proposed without any patch" in result.summary
+
+
+def test_live_reply_malformed_memory_writebacks_get_defaulted() -> None:
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    role = registry.get("qa_engineer")
+    reply = json.dumps(
+        {
+            "run_id": "run-test",
+            "role_id": "qa_engineer",
+            "status": "blocked",
+            "summary": "QA cannot approve own verdict.",
+            "proposed_patches": [],
+            "handoffs": [{"to_role": "delivery_architect"}],
+            "memory_writebacks": "not an array",
+            "proposed_actions": [{"action": "handoff_approval_request"}],
+        }
+    )
+
+    result = agent_result_from_reply("run-test", role, "qa_verdict", reply)
+
+    assert result.memory_writebacks[0].role_id == "qa_engineer"
+    assert "memory_writebacks was not an array" in result.summary
 
 
 def test_letta_role_memory_defines_domain_stack_agnostic_operating_model() -> None:

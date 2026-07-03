@@ -391,10 +391,13 @@ class RagnarOrchestrator:
     def backend_engineer(self, state: RagnarState) -> dict[str, Any]:
         return self._role_execution_artifact(
             role_id="backend_engineer",
-            action="draft_migrations",
+            action="edit_backend_worktree",
             state=state,
             output_kind="backend_work_packet",
             notes=[
+                "Implement the backend portion of the objective in the role worktree.",
+                "Return proposed_patches as unified diffs for every file change.",
+                "If no safe backend patch is possible, explain the missing repo evidence and do not propose push_branch.",
                 "Inspect services, APIs, data models, migrations, and pipelines.",
                 "Keep production data mutation out of scope without owner approval.",
             ],
@@ -404,10 +407,13 @@ class RagnarOrchestrator:
     def frontend_engineer(self, state: RagnarState) -> dict[str, Any]:
         return self._role_execution_artifact(
             role_id="frontend_engineer",
-            action="run_frontend_build",
+            action="edit_frontend_worktree",
             state=state,
             output_kind="frontend_work_packet",
             notes=[
+                "Implement the frontend portion of the objective in the role worktree.",
+                "Return proposed_patches as unified diffs for every file change.",
+                "If no safe frontend patch is possible, explain the missing repo evidence and do not propose push_branch.",
                 "Inspect UI components, pages, client state, styling, and user-facing flows.",
                 "Keep public branding changes behind owner approval.",
             ],
@@ -417,10 +423,13 @@ class RagnarOrchestrator:
     def workflow_engineer(self, state: RagnarState) -> dict[str, Any]:
         return self._role_execution_artifact(
             role_id="workflow_engineer",
-            action="propose_integration_changes",
+            action="edit_workflow_worktree",
             state=state,
             output_kind="workflow_work_packet",
             notes=[
+                "Implement the workflow/integration portion of the objective in the role worktree.",
+                "Return proposed_patches as unified diffs for every file change.",
+                "If no safe workflow patch is possible, explain the missing repo evidence and do not propose external actions.",
                 "Inspect workflow configs, automation, webhooks, and system wiring.",
                 "Do not enable external webhooks or production workflows without owner approval.",
             ],
@@ -574,6 +583,21 @@ class RagnarOrchestrator:
         diff_reports = [self.workspaces.diff(state["run_id"], role_id).to_dict() for role_id in selected_roles]
         pr_draft = build_pr_draft(state["run_id"], state["objective"], diff_reports)
         pr_draft_path = str(self.pr_drafts.save(pr_draft)) if self.record_runs else None
+        has_changes = any(report["changed_files"] for report in diff_reports)
+        proposed_actions = []
+        next_outward_action = None
+        integration_summary = "Prepared integration packet from selected role outputs."
+        if has_changes:
+            next_outward_action = "open_pull_request"
+            proposed_actions.append(
+                {
+                    "role_id": integrator.role_id,
+                    "action": "open_pull_request",
+                    "reason": "Opening a PR is an outward action and must be approved by the owner.",
+                }
+            )
+        else:
+            integration_summary = "No changed files were produced; PR opening is not proposed."
         return {
             "phase": "integration_prepared",
             "artifacts": [
@@ -581,23 +605,17 @@ class RagnarOrchestrator:
                     "integration_packet",
                     integrator.role_id,
                     {
-                        "summary": "Prepared integration packet from selected role outputs.",
+                        "summary": integration_summary,
                         "included_artifacts": [artifact["kind"] for artifact in state.get("artifacts", [])],
                         "role_diffs": diff_reports,
                         "workspace_policy_ok": all(report["policy_ok"] for report in diff_reports),
                         "pull_request_draft": pr_draft.to_dict(),
                         "pull_request_draft_path": pr_draft_path,
-                        "next_outward_action": "open_pull_request",
+                        "next_outward_action": next_outward_action,
                     },
                 )
             ],
-            "proposed_actions": [
-                {
-                    "role_id": integrator.role_id,
-                    "action": "open_pull_request",
-                    "reason": "Opening a PR is an outward action and must be approved by the owner.",
-                }
-            ],
+            "proposed_actions": proposed_actions,
             "audit_events": [_event("integrator_prepare", "prepared integration packet and proposed PR action")],
         }
 

@@ -25,13 +25,18 @@ def _render_role_packet(artifact: dict[str, Any]) -> str:
     workspace = body.get("workspace") or {}
     result = body.get("agent_result") or {}
     diff = body.get("diff") or {}
+    patch_reports = body.get("patch_reports", [])
+    rejected_actions = body.get("rejected_actions", [])
     lines = [
         f"- {artifact.get('owner_role')}: {artifact.get('kind')}",
         f"  action: {body.get('allowed_action')}",
         f"  workspace: {workspace.get('status', 'n/a')} {workspace.get('worktree_path') or ''}".rstrip(),
         f"  agent: {result.get('status', 'n/a')} schema={body.get('agent_invocation', {}).get('schema_version', 'n/a')}",
+        f"  patches: proposed={len(result.get('proposed_patches', []))} applied={sum(1 for report in patch_reports if report.get('applied'))}",
         f"  handoffs: {len(body.get('handoffs', []))} memory_writebacks: {len(body.get('memory_writebacks', []))}",
     ]
+    if rejected_actions:
+        lines.append(f"  rejected_actions: {len(rejected_actions)}")
     if diff:
         lines.append(f"  diff: files={len(diff.get('changed_files', []))} policy_ok={diff.get('policy_ok')}")
     return "\n".join(lines)

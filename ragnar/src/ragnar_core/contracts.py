@@ -140,11 +140,36 @@ def expected_role_output_schema() -> dict[str, Any]:
             "proposed_actions",
         ],
         "status_values": ["proposed", "completed", "blocked", "failed"],
+        "field_shapes": {
+            "proposed_patches": [
+                {
+                    "patch_id": "string",
+                    "summary": "string",
+                    "unified_diff": "string containing a complete unified diff",
+                }
+            ],
+            "memory_writebacks": [
+                {
+                    "text": "string",
+                    "tags": ["short", "strings"],
+                }
+            ],
+            "proposed_actions": [
+                {
+                    "action": "string from this role's authority; outward actions only",
+                    "reason": "string explaining why owner approval is needed",
+                }
+            ],
+        },
         "rules": [
             "Return JSON only.",
             "Do not claim edits were applied; return proposed_patches for the edit adapter.",
             "Every proposed patch must be a unified diff.",
+            "For implementation/edit actions, status='proposed' or status='completed' requires at least one proposed_patches item unless you explicitly explain why no safe patch is possible and do not propose push_branch.",
+            "Do not propose push_branch, open_pull_request, or any outward action when proposed_patches is empty.",
             "Every outward action must appear in proposed_actions, not as completed work.",
+            "handoffs must be an array, memory_writebacks must be an array, proposed_actions must be an array.",
+            "Do not invent approval handoffs. QA verdicts and owner approvals are handled by the orchestrator.",
             "Memory writebacks must be concise and sourced to the run/artifact.",
         ],
     }
@@ -281,11 +306,16 @@ def agent_result_from_reply(
             proposed_actions=[],
         )
 
+    parse_warnings: list[str] = []
     status = str(payload.get("status", "failed"))
     if status not in {"proposed", "completed", "blocked", "failed"}:
         status = "failed"
     summary = str(payload.get("summary") or "").strip()[:2000] or f"{role.role_id} returned no summary for {artifact_kind}."
 
+    raw_patches = payload.get("proposed_patches", [])
+    if not isinstance(raw_patches, list):
+        parse_warnings.append("proposed_patches was not an array; ignored.")
+        raw_patches = []
     proposed_patches = [
         ProposedPatch(
             patch_id=str(patch.get("patch_id", f"{role.role_id}-patch-{index}")),
@@ -293,10 +323,14 @@ def agent_result_from_reply(
             unified_diff=str(patch.get("unified_diff", "")),
             target_role=role.role_id,
         )
-        for index, patch in enumerate(payload.get("proposed_patches", []) or [])
+        for index, patch in enumerate(raw_patches)
         if isinstance(patch, dict) and patch.get("unified_diff")
     ]
 
+    raw_writebacks = payload.get("memory_writebacks", [])
+    if not isinstance(raw_writebacks, list):
+        parse_warnings.append("memory_writebacks was not an array; default writeback inserted.")
+        raw_writebacks = []
     writeback_items = [
         MemoryWriteback(
             role_id=role.role_id,
@@ -308,7 +342,7 @@ def agent_result_from_reply(
             source_run_id=run_id,
             source_artifact=artifact_kind,
         )
-        for item in (payload.get("memory_writebacks", []) or [])
+        for item in raw_writebacks
         if isinstance(item, dict) and item.get("text")
     ]
     if not writeback_items:
@@ -324,15 +358,36 @@ def agent_result_from_reply(
             )
         ]
 
+    raw_actions = payload.get("proposed_actions", [])
+    if not isinstance(raw_actions, list):
+        parse_warnings.append("proposed_actions was not an array; ignored.")
+        raw_actions = []
     proposed_actions = [
         {
             "role_id": role.role_id,
             "action": str(item["action"]),
             "reason": str(item.get("reason", "Proposed by role agent; requires policy review.")),
         }
-        for item in (payload.get("proposed_actions", []) or [])
+        for item in raw_actions
         if isinstance(item, dict) and item.get("action")
     ]
+    if not isinstance(payload.get("handoffs", []), list):
+        parse_warnings.append("handoffs was not an array; deterministic handoffs used.")
+
+    build_roles = {"backend_engineer", "frontend_engineer", "workflow_engineer"}
+    outward_without_patch = any(
+        action["action"] in {"push_branch", "open_pull_request"} for action in proposed_actions
+    ) and not proposed_patches
+    if role.role_id in build_roles and outward_without_patch:
+        parse_warnings.append("outward action proposed without any patch; proposed_actions ignored.")
+        proposed_actions = [
+            action for action in proposed_actions if action["action"] not in {"push_branch", "open_pull_request"}
+        ]
+        if status in {"proposed", "completed"}:
+            status = "blocked"
+
+    if parse_warnings:
+        summary = f"{summary} Parser warnings: {' '.join(parse_warnings)}"[:2000]
 
     return RoleAgentResult(
         schema_version=SCHEMA_VERSION,
