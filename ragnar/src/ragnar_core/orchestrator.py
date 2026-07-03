@@ -940,6 +940,7 @@ class RagnarOrchestrator:
                     }
                     for patch in agent_result.proposed_patches
                 ]
+            diff_report = self.workspaces.diff(state["run_id"], role_id) if workspace_report.available else diff_report
 
         if self.record_runs:
             self.memory_writebacks.append_many(agent_result.memory_writebacks)

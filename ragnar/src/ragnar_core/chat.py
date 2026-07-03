@@ -82,7 +82,13 @@ def render_state(state: dict[str, Any], show_json: bool = False) -> str:
                 f"- {request['role_id']} {request['action']} ({request['status']})"
             )
         lines.append("")
-        lines.append(f"approve with: /approve {state.get('run_id')} integrator open_pull_request")
+        if len(approval_requests) == 1:
+            request = approval_requests[0]
+            lines.append(f"approve with: /approve {state.get('run_id')} {request['role_id']} {request['action']}")
+        else:
+            lines.append("approve with:")
+            for request in approval_requests:
+                lines.append(f"/approve {state.get('run_id')} {request['role_id']} {request['action']}")
         lines.append("then rerun with: /rerun")
 
     return "\n".join(lines)

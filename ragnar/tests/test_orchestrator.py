@@ -219,6 +219,32 @@ def test_safe_patch_adapter_applies_allowed_patch_and_rejects_disallowed_path() 
         assert validation.disallowed_files == ["components/Button.tsx"]
 
 
+def test_safe_patch_adapter_recounts_model_hunk_lengths() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "ragnar@example.com"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "Ragnar"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "--allow-empty", "-m", "init"], cwd=root, check=True, capture_output=True)
+
+        patch = """--- /dev/null
++++ frontend/hello-world.html
+@@ -0,0 +1,99 @@
++<!DOCTYPE html>
++<html lang="en">
++<body>
++    <h1>Hello World</h1>
++</body>
++</html>
+\\ No newline at end of file
+"""
+        adapter = SafePatchAdapter(RoleWorkspaceManager(root, enabled=False))
+        report = adapter.apply("frontend_engineer", root, patch)
+
+        assert report.applied is True
+        assert (root / "frontend" / "hello-world.html").read_text(encoding="utf-8").startswith("<!DOCTYPE html>")
+
+
 def test_config_and_pr_draft_shapes() -> None:
     config = load_config(Path("ragnar/ragnar.yaml"))
     model = config.role_model("backend_engineer")
@@ -261,6 +287,25 @@ def test_chat_render_json_mode() -> None:
     rendered = render_state({"run_id": "run-1", "phase": "done", "selected_build_roles": []}, show_json=True)
 
     assert '"run_id": "run-1"' in rendered
+
+
+def test_chat_render_approval_hint_matches_pending_action() -> None:
+    rendered = render_state(
+        {
+            "run_id": "run-1",
+            "phase": "awaiting_owner_approval",
+            "selected_build_roles": ["frontend_engineer"],
+            "approval_requests": [
+                {
+                    "role_id": "frontend_engineer",
+                    "action": "push_branch",
+                    "status": "pending_owner_approval",
+                }
+            ],
+        }
+    )
+
+    assert "approve with: /approve run-1 frontend_engineer push_branch" in rendered
 
 
 def test_architect_plan_produces_real_agent_artifact_shape_offline() -> None:

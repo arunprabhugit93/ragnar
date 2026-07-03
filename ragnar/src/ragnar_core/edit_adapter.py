@@ -76,7 +76,7 @@ class SafePatchAdapter:
         )
 
     def _git_apply(self, worktree_path: Path, unified_diff: str, check_only: bool) -> subprocess.CompletedProcess[str]:
-        command = ["git", "-C", str(worktree_path), "apply"]
+        command = ["git", "-C", str(worktree_path), "apply", "--recount", f"-p{_patch_strip_level(unified_diff)}"]
         if check_only:
             command.append("--check")
         return subprocess.run(command, input=unified_diff, text=True, capture_output=True, check=False)
@@ -94,6 +94,18 @@ def extract_changed_files(unified_diff: str) -> list[str]:
             if path != "/dev/null":
                 files.add(_strip_diff_path(path))
     return sorted(path for path in files if path and not _is_unsafe_path(path))
+
+
+def _patch_strip_level(unified_diff: str) -> int:
+    for line in unified_diff.splitlines():
+        if line.startswith("diff --git "):
+            return 1
+        if line.startswith("--- ") or line.startswith("+++ "):
+            path = line[4:].strip()
+            if path == "/dev/null":
+                continue
+            return 1 if path.startswith(("a/", "b/")) else 0
+    return 1
 
 
 def _strip_diff_path(path: str) -> str:
