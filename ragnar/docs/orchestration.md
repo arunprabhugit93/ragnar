@@ -74,13 +74,40 @@ The first implementation still does not let agents freely edit code. It now prep
 
 These pieces now work without OpenAI, Anthropic, or other model provider keys:
 
+- provider/model config in `ragnar.yaml`
+- role invocation/result contracts using `ragnar-contract/v1`
 - local approval ledger at `.ragnar/approvals.jsonl`
 - local run traces at `.ragnar/runs/`
 - isolated role worktrees at `.ragnar/worktrees/<run>/<role>`
 - bounded local QA command execution
 - file-scope and command policy checks through `ragnar-workspace`
+- safe unified-diff application through `ragnar-edit`
+- local memory writeback ledger at `.ragnar/memory_writebacks.jsonl`
+- local PR drafts at `.ragnar/pr_drafts/`
 - role runtime envelopes bound to the Letta manifest when present
 - best-effort memory retrieval that degrades cleanly if pgvector or Graphiti are offline
+
+## Provider Config
+
+`ragnar.yaml` defines provider/model selection without storing any keys:
+
+```sh
+ragnar-config
+ragnar-config --role backend_engineer
+```
+
+Before provider integration, every role is set to `provider: local` and `model: provider-not-configured`. When keys arrive, this file becomes the single place to select OpenAI, Anthropic, OpenRouter, or local models per role.
+
+## Agent Contract
+
+Every build role packet now contains:
+
+- `agent_invocation`: exact JSON the provider-backed role call must receive
+- `agent_result`: provider-free result stub using the same result shape future agents must return
+- `handoffs`: structured role-to-role messages
+- `memory_writebacks`: records ready for local review, pgvector promotion, or Graphiti promotion
+
+The role output rule is strict: agents return JSON only, propose patches as unified diffs, and never claim outward actions happened.
 
 ## Isolated Worktrees
 
@@ -117,6 +144,26 @@ ragnar-workspace check-command qa_engineer "python -m compileall src"
 ```
 
 The current role nodes do not yet write code. They prepare and report the isolated execution space so the next step can safely add real edit adapters.
+
+## Edit Adapter
+
+`ragnar-edit` applies proposed unified diffs only after:
+
+- extracting changed files from the diff
+- checking every changed file against the role file-scope policy
+- running `git apply --check`
+
+Example:
+
+```sh
+ragnar-edit backend_engineer .ragnar/worktrees/<run>/backend_engineer proposed.patch
+```
+
+Use check-only mode:
+
+```sh
+ragnar-edit backend_engineer .ragnar/worktrees/<run>/backend_engineer proposed.patch --check-only
+```
 
 ## Memory Modes
 
@@ -167,3 +214,24 @@ ragnar-orchestrate "build frontend settings page and open PR" --run-id <run_id>
 ```
 
 The approval broker remains outside the LLM. The graph will only treat the action as approved if the local approval ledger has an owner approval for the same `run_id`, `role_id`, and `action`.
+
+## PR Drafts
+
+The integrator creates a local PR draft artifact but does not call GitHub:
+
+```sh
+ragnar-pr-draft <run_id>
+```
+
+The actual `open_pull_request` action remains blocked by owner approval.
+
+## Memory Writebacks
+
+Provider-free runs create memory writeback records inside role packets. When run recording is enabled, those records are also appended locally:
+
+```sh
+ragnar-memory-writebacks
+ragnar-memory-writebacks --run-id <run_id>
+```
+
+These are the records that will later be promoted into private role vector memory, shared project memory, and Graphiti temporal facts.

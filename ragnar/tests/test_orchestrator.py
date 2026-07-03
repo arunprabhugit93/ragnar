@@ -5,7 +5,10 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from ragnar_core.config import load_config
+from ragnar_core.edit_adapter import SafePatchAdapter, extract_changed_files
 from ragnar_core.orchestrator import run_objective
+from ragnar_core.pr_adapter import build_pr_draft
 from ragnar_core.workspace import RoleWorkspaceManager
 
 
@@ -57,6 +60,21 @@ def test_orchestrator_does_not_require_memory_provider() -> None:
     assert state.get("memory_context", []) == []
 
 
+def test_orchestrator_includes_agent_contract_and_writeback_format() -> None:
+    state = run_objective(
+        "fix the login bug",
+        checkpoint_db=None,
+        memory_mode="off",
+    )
+    packet = next(artifact for artifact in state["artifacts"] if artifact["kind"] == "backend_work_packet")
+
+    assert packet["body"]["agent_invocation"]["schema_version"] == "ragnar-contract/v1"
+    assert packet["body"]["agent_invocation"]["role_id"] == "backend_engineer"
+    assert packet["body"]["agent_result"]["status"] == "no_provider"
+    assert packet["body"]["handoffs"][0]["to_role"] == "qa_engineer"
+    assert packet["body"]["memory_writebacks"][0]["scope"] == "private"
+
+
 def test_qa_rejects_disallowed_command() -> None:
     state = run_objective(
         "fix the database migration",
@@ -95,3 +113,61 @@ def test_workspace_manager_prepares_isolated_git_worktree() -> None:
         assert report.available is True
         assert report.worktree_path is not None
         assert (Path(report.worktree_path) / ".git").exists()
+
+
+def test_safe_patch_adapter_applies_allowed_patch_and_rejects_disallowed_path() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "ragnar@example.com"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "Ragnar"], cwd=root, check=True)
+        service_path = root / "src" / "service"
+        service_path.mkdir(parents=True)
+        (service_path / "users.py").write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "src/service/users.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=root, check=True, capture_output=True)
+
+        patch = """diff --git a/src/service/users.py b/src/service/users.py
+--- a/src/service/users.py
++++ b/src/service/users.py
+@@ -1 +1 @@
+-value = 1
++value = 2
+"""
+        adapter = SafePatchAdapter(RoleWorkspaceManager(root, enabled=False))
+        report = adapter.apply("backend_engineer", root, patch)
+
+        assert report.applied is True
+        assert (service_path / "users.py").read_text(encoding="utf-8") == "value = 2\n"
+        assert extract_changed_files(patch) == ["src/service/users.py"]
+
+        disallowed_patch = """diff --git a/components/Button.tsx b/components/Button.tsx
+--- a/components/Button.tsx
++++ b/components/Button.tsx
+@@ -1 +1 @@
+-old
++new
+"""
+        validation = adapter.validate("backend_engineer", disallowed_patch)
+        assert validation.allowed is False
+        assert validation.disallowed_files == ["components/Button.tsx"]
+
+
+def test_config_and_pr_draft_shapes() -> None:
+    config = load_config(Path("ragnar/ragnar.yaml"))
+    model = config.role_model("backend_engineer")
+    draft = build_pr_draft(
+        "run-1",
+        "fix auth API",
+        [
+            {
+                "branch": "ragnar/run-1/backend_engineer",
+                "changed_files": ["src/service/users.py"],
+            }
+        ],
+    )
+
+    assert model.provider == "local"
+    assert draft.status == "draft_only"
+    assert draft.source_branches == ["ragnar/run-1/backend_engineer"]
+    assert draft.changed_files == ["src/service/users.py"]

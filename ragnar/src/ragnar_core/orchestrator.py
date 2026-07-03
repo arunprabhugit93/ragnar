@@ -12,9 +12,13 @@ from typing import Annotated, Any, Literal, TypedDict
 
 from .approval_store import ApprovalStore, default_approvals_path
 from .approval_broker import ApprovalBroker, Decision
+from .config import RagnarConfig, default_config_path, load_config
+from .contracts import build_invocation_contract, provider_free_result
 from .context_memory import ContextMemoryProvider, MemoryMode
 from .execution import LocalExecutionAdapter
+from .memory_writeback import MemoryWritebackStore, default_writeback_path
 from .observability import RunRecorder, default_runs_path
+from .pr_adapter import PullRequestDraftStore, build_pr_draft, default_pr_draft_dir
 from .role_runtime import RoleRuntime, default_manifest_path
 from .role_registry import RoleContract, RoleRegistry, load_role_registry
 from .workspace import RoleWorkspaceManager, policies_as_dict
@@ -98,17 +102,21 @@ class RagnarOrchestrator:
         approvals_path: Path | None = None,
         runs_path: Path | None = None,
         manifest_path: Path | None = None,
+        config_path: Path | None = None,
         record_runs: bool = True,
         prepare_worktrees: bool = True,
     ) -> None:
         self.registry = registry
         self.approval_broker = ApprovalBroker()
         repo_root = _repo_root()
+        self.config: RagnarConfig = load_config(config_path or default_config_path())
         self.memory_provider = ContextMemoryProvider(mode=memory_mode)
         self.execution = LocalExecutionAdapter(repo_root)
         self.workspaces = RoleWorkspaceManager(repo_root, enabled=prepare_worktrees)
         self.role_runtime = RoleRuntime(manifest_path or default_manifest_path(repo_root))
         self.approval_store = ApprovalStore(approvals_path or default_approvals_path(repo_root))
+        self.memory_writebacks = MemoryWritebackStore(default_writeback_path(repo_root))
+        self.pr_drafts = PullRequestDraftStore(default_pr_draft_dir(repo_root))
         self.recorder = RunRecorder(runs_path or default_runs_path(repo_root))
         self.qa_commands = qa_commands or []
         self.record_runs = record_runs
@@ -181,6 +189,11 @@ class RagnarOrchestrator:
             "phase": "created",
             "qa_commands": self.qa_commands,
             "workspace_enabled": self.workspaces.enabled,
+            "config": {
+                "version": self.config.version,
+                "memory_mode": self.config.memory_mode(),
+                "provider_default": self.config.to_dict().get("providers", {}).get("default"),
+            },
         }
         if checkpoint_db is None:
             app = self.build_graph()
@@ -275,6 +288,7 @@ class RagnarOrchestrator:
                             "Integrator may prepare artifacts but cannot merge or deploy.",
                         ],
                         "workspace_policy": policies_as_dict(),
+                        "agent_contract_schema": "ragnar-contract/v1",
                     },
                 )
             ],
@@ -373,6 +387,8 @@ class RagnarOrchestrator:
             raise RuntimeError(f"Integrator cannot prepare PR draft: {draft_decision.reason}")
         selected_roles = state.get("selected_build_roles", [])
         diff_reports = [self.workspaces.diff(state["run_id"], role_id).to_dict() for role_id in selected_roles]
+        pr_draft = build_pr_draft(state["run_id"], state["objective"], diff_reports)
+        pr_draft_path = str(self.pr_drafts.save(pr_draft)) if self.record_runs else None
         return {
             "phase": "integration_prepared",
             "artifacts": [
@@ -384,6 +400,8 @@ class RagnarOrchestrator:
                         "included_artifacts": [artifact["kind"] for artifact in state.get("artifacts", [])],
                         "role_diffs": diff_reports,
                         "workspace_policy_ok": all(report["policy_ok"] for report in diff_reports),
+                        "pull_request_draft": pr_draft.to_dict(),
+                        "pull_request_draft_path": pr_draft_path,
                         "next_outward_action": "open_pull_request",
                     },
                 )
@@ -568,6 +586,25 @@ class RagnarOrchestrator:
         runtime_result = self.role_runtime.run(role, state["objective"], action, role_context)
         workspace_report = self.workspaces.prepare(state["run_id"], role_id)
         diff_report = self.workspaces.diff(state["run_id"], role_id) if workspace_report.available else None
+        policy = self.workspaces.policies[role_id]
+        invocation = build_invocation_contract(
+            run_id=state["run_id"],
+            objective=state["objective"],
+            action=action,
+            role=role,
+            model=self.config.role_model(role_id),
+            workspace=workspace_report.to_dict(),
+            policy=policy,
+            memory_context=role_context,
+        )
+        agent_result = provider_free_result(
+            state["run_id"],
+            role,
+            output_kind,
+            f"Provider-free bounded packet for {role_id}; no edits proposed.",
+        )
+        if self.record_runs:
+            self.memory_writebacks.append_many(agent_result.memory_writebacks)
         return {
             "phase": f"{role_id}_complete",
             "artifacts": [
@@ -589,6 +626,10 @@ class RagnarOrchestrator:
                         "role_runtime": runtime_result.to_dict(),
                         "workspace": workspace_report.to_dict(),
                         "diff": diff_report.to_dict() if diff_report else None,
+                        "agent_invocation": invocation.to_dict(),
+                        "agent_result": agent_result.to_dict(),
+                        "handoffs": [handoff.to_dict() for handoff in agent_result.handoffs],
+                        "memory_writebacks": [writeback.to_dict() for writeback in agent_result.memory_writebacks],
                         "notes": notes,
                     },
                 )
@@ -616,6 +657,7 @@ def run_objective(
     qa_commands: list[list[str]] | None = None,
     record_runs: bool = False,
     prepare_worktrees: bool = False,
+    config_path: Path | None = None,
 ) -> RagnarState:
     registry = load_role_registry(roles_path or _default_roles_path())
     orchestrator = RagnarOrchestrator(
@@ -624,6 +666,7 @@ def run_objective(
         qa_commands=qa_commands,
         record_runs=record_runs,
         prepare_worktrees=prepare_worktrees,
+        config_path=config_path,
     )
     return orchestrator.invoke(objective, checkpoint_db=checkpoint_db, run_id=run_id)
 
@@ -632,6 +675,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the strict Ragnar LangGraph orchestrator.")
     parser.add_argument("objective")
     parser.add_argument("--roles", type=Path, default=_default_roles_path())
+    parser.add_argument("--config", type=Path, default=default_config_path())
     parser.add_argument("--checkpoint-db", type=Path, default=_default_checkpoint_path())
     parser.add_argument("--run-id", help="Reuse a run ID, usually after approving a pending action.")
     parser.add_argument(
@@ -662,6 +706,7 @@ def main() -> None:
         qa_commands=qa_commands,
         record_runs=not args.no_record_runs,
         prepare_worktrees=not args.no_worktrees,
+        config_path=args.config,
     )
     if args.json:
         print(json.dumps(state, indent=2, default=str))

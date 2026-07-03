@@ -41,6 +41,8 @@ class WorkspaceReport:
 class DiffReport:
     role_id: str
     available: bool
+    branch: str | None
+    worktree_path: str | None
     changed_files: list[str]
     disallowed_files: list[str]
     status_short: str
@@ -250,7 +252,7 @@ class RoleWorkspaceManager:
     def diff(self, run_id: str, role_id: str) -> DiffReport:
         report = self.prepare(run_id, role_id)
         if not report.available or report.worktree_path is None:
-            return DiffReport(role_id, False, [], [], "", "", False)
+            return DiffReport(role_id, False, report.branch, report.worktree_path, [], [], "", "", False)
         worktree_path = Path(report.worktree_path)
         status = self._run(["git", "-C", str(worktree_path), "status", "--short"])
         diff_stat = self._run(["git", "-C", str(worktree_path), "diff", "--stat"])
@@ -259,6 +261,8 @@ class RoleWorkspaceManager:
         return DiffReport(
             role_id=role_id,
             available=True,
+            branch=report.branch,
+            worktree_path=report.worktree_path,
             changed_files=changed,
             disallowed_files=disallowed,
             status_short=status.stdout,

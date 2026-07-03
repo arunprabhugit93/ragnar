@@ -1,0 +1,67 @@
+version: 0.1
+
+providers:
+  default: local
+  allowed:
+    - local
+    - openai
+    - anthropic
+    - openrouter
+
+models:
+  default:
+    provider: local
+    model: provider-not-configured
+    temperature: 0.1
+    max_tokens: 4096
+  roles:
+    conductor:
+      provider: local
+      model: provider-not-configured
+      temperature: 0.1
+      max_tokens: 4096
+    delivery_architect:
+      provider: local
+      model: provider-not-configured
+      temperature: 0.1
+      max_tokens: 4096
+    backend_engineer:
+      provider: local
+      model: provider-not-configured
+      temperature: 0.1
+      max_tokens: 4096
+    frontend_engineer:
+      provider: local
+      model: provider-not-configured
+      temperature: 0.1
+      max_tokens: 4096
+    workflow_engineer:
+      provider: local
+      model: provider-not-configured
+      temperature: 0.1
+      max_tokens: 4096
+    qa_engineer:
+      provider: local
+      model: provider-not-configured
+      temperature: 0.0
+      max_tokens: 4096
+    integrator:
+      provider: local
+      model: provider-not-configured
+      temperature: 0.0
+      max_tokens: 4096
+
+memory:
+  mode: auto
+  max_hits_per_query: 3
+  writeback:
+    local_jsonl: .ragnar/memory_writebacks.jsonl
+
+execution:
+  prepare_worktrees: true
+  require_policy_clean_diff: true
+  allow_agent_edits: false
+
+pull_requests:
+  mode: draft_only
+  draft_dir: .ragnar/pr_drafts

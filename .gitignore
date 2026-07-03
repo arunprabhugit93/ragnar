@@ -29,11 +29,15 @@ node_modules/
 .ragnar/runs/
 .ragnar/worktrees/
 .ragnar/approvals.jsonl
+.ragnar/memory_writebacks.jsonl
+.ragnar/pr_drafts/
 ragnar/.ragnar/runtime/
 ragnar/.ragnar/logs/
 ragnar/.ragnar/runs/
 ragnar/.ragnar/worktrees/
 ragnar/.ragnar/approvals.jsonl
+ragnar/.ragnar/memory_writebacks.jsonl
+ragnar/.ragnar/pr_drafts/
 *.log
 *.sqlite
 *.sqlite3
