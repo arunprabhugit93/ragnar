@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
 
+from .agent_transcripts import AgentTranscriptStore, default_transcripts_path
 from .approval_store import ApprovalStore, default_approvals_path
 from .approval_broker import ApprovalBroker, Decision
 from .config import RagnarConfig, default_config_path, load_config
@@ -140,9 +141,12 @@ class RagnarOrchestrator:
             mode=role_runtime_mode,
             base_url=os.environ.get("LETTA_SERVER_URL", "http://localhost:8283"),
             api_key=os.environ.get("LETTA_API_KEY"),
+            enable_agent_messaging=self.config.enable_agent_messaging(),
+            agent_max_steps=self.config.agent_max_steps(),
         )
         self.approval_store = ApprovalStore(approvals_path or default_approvals_path(repo_root))
         self.memory_writebacks = MemoryWritebackStore(default_writeback_path(repo_root))
+        self.agent_transcripts = AgentTranscriptStore(default_transcripts_path(repo_root))
         self.pr_drafts = PullRequestDraftStore(default_pr_draft_dir(repo_root))
         self.recorder = RunRecorder(runs_path or default_runs_path(repo_root))
         self.qa_commands = qa_commands or []
@@ -304,7 +308,7 @@ class RagnarOrchestrator:
 
     def architect_plan(self, state: RagnarState) -> dict[str, Any]:
         revision_count = state.get("plan_revision_count", 0)
-        feedback = state.get("plan_review_feedback") if revision_count > 0 else None
+        feedback = {"conductor_feedback": state.get("plan_review_feedback")} if revision_count > 0 else None
         return self._role_execution_artifact(
             role_id="delivery_architect",
             action="create_delivery_plan",
@@ -328,7 +332,7 @@ class RagnarOrchestrator:
             state=state,
             subject_artifact=plan_artifact,
             revision_count_key="plan_revision_count",
-            max_revisions=MAX_PLAN_REVISIONS,
+            max_revisions=self.config.max_plan_revisions(default=MAX_PLAN_REVISIONS),
             review_instructions=[
                 "Review the architect's delivery plan for completeness and fit to the objective.",
                 "verdict='revise' sends it back to the architect with your feedback; "
@@ -352,10 +356,16 @@ class RagnarOrchestrator:
             "audit_events": [_event("dispatch_build_roles", "dispatching bounded role nodes", roles=selected)],
         }
 
-    def _rework_feedback_for(self, state: RagnarState, role_id: str) -> str | None:
-        if role_id in state.get("qa_rework_roles", []):
-            return state.get("qa_review_feedback")
-        return None
+    def _rework_feedback_for(self, state: RagnarState, role_id: str) -> dict[str, Any] | None:
+        if role_id not in state.get("qa_rework_roles", []):
+            return None
+        qa_artifact = self._latest_artifact(state, "qa_verdict")
+        qa_body = qa_artifact["body"] if qa_artifact else {}
+        return {
+            "conductor_feedback": state.get("qa_review_feedback"),
+            "qa_verdict": qa_body.get("verdict"),
+            "qa_commands": qa_body.get("commands", []),
+        }
 
     def backend_engineer(self, state: RagnarState) -> dict[str, Any]:
         return self._role_execution_artifact(
@@ -457,6 +467,8 @@ class RagnarOrchestrator:
 
         if self.record_runs:
             self.memory_writebacks.append_many(agent_result.memory_writebacks)
+        if self.record_runs and runtime_result.transcript is not None:
+            self.agent_transcripts.append(state["run_id"], qa.role_id, "produce_qa_verdict", runtime_result.transcript)
 
         proposed_actions = []
         rejected_actions = []
@@ -481,6 +493,7 @@ class RagnarOrchestrator:
                         "warnings": warnings,
                         "agent_invocation": invocation.to_dict(),
                         "agent_result": agent_result.to_dict(),
+                        "agent_transcript_summary": self._transcript_summary(runtime_result.transcript),
                         "rejected_actions": rejected_actions,
                     },
                 )
@@ -497,7 +510,7 @@ class RagnarOrchestrator:
             state=state,
             subject_artifact=qa_artifact,
             revision_count_key="qa_revision_count",
-            max_revisions=MAX_QA_REVISIONS,
+            max_revisions=self.config.max_qa_revisions(default=MAX_QA_REVISIONS),
             review_instructions=[
                 "Review the QA verdict and the build work packets it reviewed.",
                 "verdict='revise' sends work back to the build role(s) named in rework_roles; "
@@ -668,6 +681,8 @@ class RagnarOrchestrator:
         runtime_result = self.role_runtime.run(
             conductor, state["objective"], "summarize_status", memory_context, invocation=invocation
         )
+        if self.record_runs and runtime_result.transcript is not None:
+            self.agent_transcripts.append(state["run_id"], conductor.role_id, "summarize_status", runtime_result.transcript)
         if runtime_result.raw_reply is not None:
             try:
                 payload = json.loads(extract_json_object(runtime_result.raw_reply))
@@ -803,7 +818,7 @@ class RagnarOrchestrator:
         state: RagnarState,
         output_kind: str,
         notes: list[str],
-        rework_feedback: str | None = None,
+        rework_feedback: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         role = self.registry.get(role_id)
         decision = self.approval_broker.decide(role, action)
@@ -834,6 +849,11 @@ class RagnarOrchestrator:
                 output_kind,
                 f"Provider-free bounded packet for {role_id}; no edits proposed.",
             )
+
+        if self.record_runs and runtime_result.transcript is not None:
+            self.agent_transcripts.append(state["run_id"], role_id, action, runtime_result.transcript)
+        role_runtime_dict = runtime_result.to_dict()
+        role_runtime_dict["transcript"] = None  # full detail lives in .ragnar/agent_transcripts.jsonl
 
         patch_reports: list[dict[str, Any]] = []
         if agent_result.proposed_patches and workspace_report.available and workspace_report.worktree_path:
@@ -885,7 +905,8 @@ class RagnarOrchestrator:
                             or query.get("namespace") == role.private_memory_namespace
                         ],
                         "memory_context": role_context,
-                        "role_runtime": runtime_result.to_dict(),
+                        "role_runtime": role_runtime_dict,
+                        "agent_transcript_summary": self._transcript_summary(runtime_result.transcript),
                         "workspace": workspace_report.to_dict(),
                         "diff": diff_report.to_dict() if diff_report else None,
                         "agent_invocation": invocation.to_dict(),
@@ -914,6 +935,16 @@ class RagnarOrchestrator:
 
     def _latest_artifact(self, state: RagnarState, kind: str) -> dict[str, Any] | None:
         return next((artifact for artifact in reversed(state.get("artifacts", [])) if artifact["kind"] == kind), None)
+
+    def _transcript_summary(self, transcript: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not transcript:
+            return None
+        messages = transcript.get("messages", [])
+        return {
+            "message_count": len(messages),
+            "tool_calls": [message["tool_name"] for message in messages if message.get("tool_name")],
+            "store": "agent_transcripts.jsonl",
+        }
 
     def _conductor_review(
         self,
@@ -985,6 +1016,11 @@ class RagnarOrchestrator:
                 }
             )
 
+        if self.record_runs and runtime_result.transcript is not None:
+            self.agent_transcripts.append(state["run_id"], conductor.role_id, action, runtime_result.transcript)
+        role_runtime_dict = runtime_result.to_dict()
+        role_runtime_dict["transcript"] = None  # full detail lives in .ragnar/agent_transcripts.jsonl
+
         artifact = _artifact(
             f"conductor_{review_kind}",
             conductor.role_id,
@@ -996,7 +1032,8 @@ class RagnarOrchestrator:
                 "feedback": review.feedback,
                 "rework_roles": review.rework_roles,
                 "revision_count": revision_count,
-                "role_runtime": runtime_result.to_dict(),
+                "role_runtime": role_runtime_dict,
+                "agent_transcript_summary": self._transcript_summary(runtime_result.transcript),
                 "agent_invocation": invocation.to_dict(),
                 "review_instructions": review_instructions,
             },

@@ -45,6 +45,18 @@ class RagnarConfig:
     def allow_agent_edits(self) -> bool:
         return bool(self.raw.get("execution", {}).get("allow_agent_edits", False))
 
+    def enable_agent_messaging(self) -> bool:
+        return bool(self.raw.get("execution", {}).get("enable_agent_messaging", False))
+
+    def agent_max_steps(self) -> int:
+        return int(self.raw.get("execution", {}).get("agent_max_steps", 12))
+
+    def max_plan_revisions(self, default: int = 2) -> int:
+        return int(self.raw.get("execution", {}).get("max_plan_revisions", default))
+
+    def max_qa_revisions(self, default: int = 2) -> int:
+        return int(self.raw.get("execution", {}).get("max_qa_revisions", default))
+
     def to_dict(self) -> dict[str, Any]:
         return self.raw
 

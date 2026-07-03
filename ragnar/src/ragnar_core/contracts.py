@@ -72,7 +72,7 @@ class RoleInvocationContract:
     memory_context: list[dict[str, Any]]
     handoff_inputs: list[dict[str, Any]]
     expected_output_schema: dict[str, Any]
-    rework_feedback: str | None = None
+    rework_feedback: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -176,7 +176,7 @@ def build_invocation_contract(
     policy: RoleWorkspacePolicy | None,
     memory_context: list[dict[str, Any]],
     handoff_inputs: list[dict[str, Any]] | None = None,
-    rework_feedback: str | None = None,
+    rework_feedback: dict[str, Any] | None = None,
     expected_output_schema: dict[str, Any] | None = None,
 ) -> RoleInvocationContract:
     return RoleInvocationContract(

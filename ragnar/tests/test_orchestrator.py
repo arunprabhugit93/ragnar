@@ -7,13 +7,15 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from ragnar_core.agent_transcripts import AgentTranscriptStore
 from ragnar_core.chat import ChatSession, render_state
-from ragnar_core.config import load_config
+from ragnar_core.config import ModelConfig, RagnarConfig, load_config
+from ragnar_core.contracts import build_invocation_contract
 from ragnar_core.edit_adapter import SafePatchAdapter, extract_changed_files
 from ragnar_core.orchestrator import MAX_PLAN_REVISIONS, RagnarOrchestrator, run_objective
 from ragnar_core.pr_adapter import build_pr_draft
 from ragnar_core.role_registry import load_role_registry
-from ragnar_core.role_runtime import RoleRuntimeResult
+from ragnar_core.role_runtime import RoleRuntime, RoleRuntimeResult
 from ragnar_core.workspace import RoleWorkspaceManager
 
 
@@ -287,10 +289,11 @@ def test_plan_revision_loop_respects_retry_cap() -> None:
 
     state = orchestrator.invoke("fix the login bug")
 
-    assert state["plan_revision_count"] == MAX_PLAN_REVISIONS
+    expected_cap = orchestrator.config.max_plan_revisions(default=MAX_PLAN_REVISIONS)
+    assert state["plan_revision_count"] == expected_cap
     assert state["plan_review_verdict"] == "escalated_to_owner"
     plan_artifacts = [a for a in state["artifacts"] if a["kind"] == "architecture_plan"]
-    assert len(plan_artifacts) == MAX_PLAN_REVISIONS + 1
+    assert len(plan_artifacts) == expected_cap + 1
     assert state.get("final_report")
 
 
@@ -301,6 +304,7 @@ def test_qa_revision_loop_routes_back_to_named_role() -> None:
         config_path=Path("ragnar/ragnar.yaml"),
         prepare_worktrees=False,
         record_runs=False,
+        qa_commands=[[sys.executable, "-m", "pytest", "-q", "/nonexistent-test-file-xyz.py"]],
     )
     orchestrator.role_runtime = _ScriptedRoleRuntime(
         {
@@ -315,7 +319,9 @@ def test_qa_revision_loop_routes_back_to_named_role() -> None:
 
     backend_packets = [a for a in state["artifacts"] if a["kind"] == "backend_work_packet"]
     assert len(backend_packets) == 2
-    assert backend_packets[1]["body"]["agent_invocation"]["rework_feedback"] == "fix the auth check"
+    rework_feedback = backend_packets[1]["body"]["agent_invocation"]["rework_feedback"]
+    assert rework_feedback["conductor_feedback"] == "fix the auth check"
+    assert rework_feedback["qa_commands"][0]["exit_code"] != 0
     assert state["qa_review_verdict"] == "approve"
 
 
@@ -334,3 +340,156 @@ def test_final_report_includes_owner_briefing_offline() -> None:
         "blocked",
         "approval_requests",
     }
+
+
+class _FakeAssistantMessage:
+    message_type = "assistant_message"
+
+    def __init__(self, content: str) -> None:
+        self.id = "msg-assistant-1"
+        self.content = content
+        self.date = "2024-01-01T00:00:00"
+        self.sender_id = "agent-under-test"
+
+
+class _FakeToolCall:
+    def __init__(self, name: str, arguments: str) -> None:
+        self.name = name
+        self.arguments = arguments
+
+
+class _FakeToolCallMessage:
+    message_type = "tool_call_message"
+
+    def __init__(self, tool_call: _FakeToolCall) -> None:
+        self.id = "msg-tool-call-1"
+        self.date = "2024-01-01T00:00:01"
+        self.sender_id = "agent-under-test"
+        self.tool_call = tool_call
+
+
+class _FakeToolReturnMessage:
+    message_type = "tool_return_message"
+
+    def __init__(self, tool_return: str, is_err: bool = False) -> None:
+        self.id = "msg-tool-return-1"
+        self.date = "2024-01-01T00:00:02"
+        self.sender_id = "agent-under-test"
+        self.tool_return = tool_return
+        self.is_err = is_err
+
+
+class _FakeResponse:
+    def __init__(self, messages: list[Any]) -> None:
+        self.messages = messages
+
+
+class _FakeMessagesAPI:
+    def __init__(self, response: _FakeResponse) -> None:
+        self.response = response
+        self.calls: list[dict[str, Any]] = []
+
+    def create(self, **kwargs: Any) -> _FakeResponse:
+        self.calls.append(kwargs)
+        return self.response
+
+
+class _FakeAgentsAPI:
+    def __init__(self, response: _FakeResponse) -> None:
+        self.messages = _FakeMessagesAPI(response)
+
+
+class _FakeLettaClient:
+    def __init__(self, response: _FakeResponse) -> None:
+        self.agents = _FakeAgentsAPI(response)
+
+
+def _build_test_invocation(role_id: str):
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    role = registry.get(role_id)
+    return build_invocation_contract(
+        run_id="run-test",
+        objective="test objective",
+        action="draft_migrations",
+        role=role,
+        model=ModelConfig(provider="openrouter", model="openrouter/x/y", temperature=0.1, max_tokens=100),
+        workspace={"available": False},
+        policy=None,
+        memory_context=[],
+    )
+
+
+def test_call_agent_sets_max_steps_and_peer_block_when_enabled() -> None:
+    reply_json = '{"status":"completed","summary":"ok","proposed_patches":[],"handoffs":[],"memory_writebacks":[],"proposed_actions":[]}'
+    fake_client = _FakeLettaClient(
+        _FakeResponse(
+            [
+                _FakeToolCallMessage(_FakeToolCall("send_message_to_agents_matching_tags", '{"match_some": ["role:qa_engineer"]}')),
+                _FakeToolReturnMessage('{"agent_id": "agent-qa", "response": ["ack"]}'),
+                _FakeAssistantMessage(reply_json),
+            ]
+        )
+    )
+    runtime = RoleRuntime(
+        Path("ragnar/.ragnar/letta_agents.json"),
+        mode="letta",
+        enable_agent_messaging=True,
+        agent_max_steps=7,
+    )
+    runtime._client = fake_client
+
+    invocation = _build_test_invocation("backend_engineer")
+    raw_reply, transcript = runtime._call_agent("agent-under-test", invocation)
+
+    call_kwargs = fake_client.agents.messages.calls[0]
+    assert call_kwargs["max_steps"] == 7
+    prompt_content = call_kwargs["messages"][0]["content"]
+    assert "send_message_to_agents_matching_tags" in prompt_content
+    assert "role:qa_engineer" in prompt_content
+    assert raw_reply == reply_json
+    assert transcript["messages"][0]["message_type"] == "tool_call_message"
+    assert transcript["messages"][0]["tool_name"] == "send_message_to_agents_matching_tags"
+    assert transcript["messages"][2]["message_type"] == "assistant_message"
+
+
+def test_call_agent_omits_peer_block_when_disabled() -> None:
+    reply_json = '{"status":"completed","summary":"ok","proposed_patches":[],"handoffs":[],"memory_writebacks":[],"proposed_actions":[]}'
+    fake_client = _FakeLettaClient(_FakeResponse([_FakeAssistantMessage(reply_json)]))
+    runtime = RoleRuntime(
+        Path("ragnar/.ragnar/letta_agents.json"),
+        mode="letta",
+        enable_agent_messaging=False,
+        agent_max_steps=12,
+    )
+    runtime._client = fake_client
+
+    invocation = _build_test_invocation("backend_engineer")
+    runtime._call_agent("agent-under-test", invocation)
+
+    call_kwargs = fake_client.agents.messages.calls[0]
+    assert call_kwargs["max_steps"] == 12
+    prompt_content = call_kwargs["messages"][0]["content"]
+    assert "send_message_to_agents_matching_tags" not in prompt_content
+
+
+def test_agent_transcript_store_appends_and_filters_by_run_id(tmp_path: Path) -> None:
+    store = AgentTranscriptStore(tmp_path / "agent_transcripts.jsonl")
+    store.append("run-1", "backend_engineer", "draft_migrations", {"agent_id": "a1", "max_steps": 7, "messages": []})
+    store.append("run-2", "qa_engineer", "produce_qa_verdict", {"agent_id": "a2", "max_steps": 7, "messages": []})
+
+    all_records = store.list()
+    assert len(all_records) == 2
+    run1_records = store.list(run_id="run-1")
+    assert len(run1_records) == 1
+    assert run1_records[0]["role_id"] == "backend_engineer"
+
+
+def test_revision_caps_configurable_via_ragnar_config() -> None:
+    config = RagnarConfig(version="0.1", raw={"execution": {"max_plan_revisions": 1, "max_qa_revisions": 3}})
+
+    assert config.max_plan_revisions(default=MAX_PLAN_REVISIONS) == 1
+    assert config.max_qa_revisions(default=2) == 3
+
+    default_config = RagnarConfig(version="0.1", raw={})
+    assert default_config.max_plan_revisions(default=MAX_PLAN_REVISIONS) == MAX_PLAN_REVISIONS
+    assert default_config.max_qa_revisions(default=2) == 2

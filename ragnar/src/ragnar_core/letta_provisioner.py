@@ -298,7 +298,7 @@ def main() -> None:
             api_key=args.api_key,
             model=args.model,
             embedding=args.embedding,
-            communication_tools=not args.no_communication_tools,
+            communication_tools=(not args.no_communication_tools) and (config is None or config.enable_agent_messaging()),
             dry_run=args.dry_run,
             config=config,
         )

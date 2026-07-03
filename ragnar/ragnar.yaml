@@ -71,6 +71,21 @@ execution:
   # SafePatchAdapter (still checked against the role's file-scope policy
   # regardless of this flag). Set false to review patches without writing them.
   allow_agent_edits: true
+  # Real Letta-native agent-to-agent messaging (send_message_to_agents_matching_tags).
+  # Off by default -- flipping this off stops the effect immediately even if an
+  # already-provisioned agent still has the tool attached, since the model is
+  # never prompted toward using it. Re-provisioning also gates tool attachment
+  # itself via ragnar-provision-letta.
+  enable_agent_messaging: false
+  # Hard cap on Letta's own internal reasoning/tool-call steps per role turn.
+  # Letta's server-side default is 50; kept low here to bound cost even with
+  # agent-to-agent messaging enabled.
+  agent_max_steps: 12
+  # How many times the conductor may send plan/QA work back for revision before
+  # escalating to the owner instead of looping forever. "repeat until green" in
+  # spirit -- raise this if you want more autonomous iteration before being asked.
+  max_plan_revisions: 5
+  max_qa_revisions: 5
 
 pull_requests:
   mode: draft_only

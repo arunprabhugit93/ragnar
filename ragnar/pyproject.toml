@@ -25,6 +25,7 @@ ragnar-workspace = "ragnar_core.workspace_cli:main"
 ragnar-config = "ragnar_core.config:main"
 ragnar-edit = "ragnar_core.edit_adapter:main"
 ragnar-memory-writebacks = "ragnar_core.memory_writeback:main"
+ragnar-agent-transcripts = "ragnar_core.agent_transcripts:main"
 ragnar-pr-draft = "ragnar_core.pr_adapter:main"
 ragnar-chat = "ragnar_core.chat:main"
 
