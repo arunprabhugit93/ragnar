@@ -38,6 +38,7 @@ from .workspace import RoleWorkspaceManager
 
 BuildRole = Literal["backend_engineer", "frontend_engineer", "workflow_engineer"]
 BUILD_SEQUENCE: tuple[BuildRole, ...] = ("backend_engineer", "frontend_engineer", "workflow_engineer")
+BUILD_ROLE_SET = set(BUILD_SEQUENCE)
 
 MAX_PLAN_REVISIONS = 2
 MAX_QA_REVISIONS = 2
@@ -807,6 +808,15 @@ class RagnarOrchestrator:
             "queue",
         }
         frontend_terms = {
+            "html",
+            "htm",
+            "webpage",
+            "webpages",
+            "website",
+            "websites",
+            "static",
+            "index",
+            "landing",
             "ui",
             "ux",
             "frontend",
@@ -835,15 +845,21 @@ class RagnarOrchestrator:
             "n8n",
             "trigger",
         }
+        frontend_typos = {"pag", "htm", "frntend", "fronted"}
         if words & backend_terms or any(phrase in normalized for phrase in ("data model", "business logic", "rest api")):
             selected.append("backend_engineer")
-        if words & frontend_terms or any(phrase in normalized for phrase in ("user interface", "design system", "landing page")):
+        if words & frontend_terms or words & frontend_typos or any(phrase in normalized for phrase in ("user interface", "design system", "landing page")):
             selected.append("frontend_engineer")
         if words & workflow_terms or any(phrase in normalized for phrase in ("third party", "third_party", "external system")):
             selected.append("workflow_engineer")
         if not selected:
             selected.append("backend_engineer")
         return selected
+
+    def _merge_build_roles(self, current: list[str], requested: list[str]) -> list[str]:
+        selected = set(current)
+        selected.update(role_id for role_id in requested if role_id in BUILD_ROLE_SET)
+        return [role_id for role_id in BUILD_SEQUENCE if role_id in selected]
 
     def _context_queries(self, objective: str, selected_roles: list[str]) -> list[dict[str, Any]]:
         queries = [{"scope": "shared", "namespace": "project_context", "query": objective}]
@@ -941,8 +957,16 @@ class RagnarOrchestrator:
                 continue
             proposed_actions.append({"role_id": item["role_id"], "action": item["action"], "reason": item["reason"]})
 
+        requested_handoffs = (
+            agent_result.requested_handoff_roles
+            if agent_result.status == "blocked" and not agent_result.proposed_patches
+            else []
+        )
+        next_selected_roles = self._merge_build_roles(state.get("selected_build_roles", []), requested_handoffs)
+
         return {
             "phase": f"{role_id}_complete",
+            "selected_build_roles": next_selected_roles,
             "artifacts": [
                 _artifact(
                     output_kind,
@@ -966,6 +990,7 @@ class RagnarOrchestrator:
                         "agent_invocation": invocation.to_dict(),
                         "agent_result": agent_result.to_dict(),
                         "handoffs": [handoff.to_dict() for handoff in agent_result.handoffs],
+                        "requested_handoff_roles": requested_handoffs,
                         "memory_writebacks": [writeback.to_dict() for writeback in agent_result.memory_writebacks],
                         "patch_reports": patch_reports,
                         "rejected_actions": rejected_actions,
@@ -974,7 +999,14 @@ class RagnarOrchestrator:
                 )
             ],
             "proposed_actions": proposed_actions,
-            "audit_events": [_event(role_id, "completed bounded role node", action=action)],
+            "audit_events": [
+                _event(
+                    role_id,
+                    "completed bounded role node",
+                    action=action,
+                    requested_handoff_roles=requested_handoffs,
+                )
+            ],
         }
 
     def _role_memory_context(self, state: RagnarState, role: RoleContract) -> list[dict[str, Any]]:

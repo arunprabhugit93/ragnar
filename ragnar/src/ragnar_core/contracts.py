@@ -90,6 +90,7 @@ class RoleAgentResult:
     handoffs: list[HandoffArtifact]
     memory_writebacks: list[MemoryWriteback]
     proposed_actions: list[dict[str, Any]]
+    requested_handoff_roles: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -242,6 +243,30 @@ def _deterministic_handoffs(role: RoleContract, artifact_kind: str, summary: str
         )
         for target in role.handoffs.get("sends_to", [])
     ]
+
+
+def _requested_build_handoffs(payload: dict[str, Any], current_role_id: str) -> list[str]:
+    build_roles = {"backend_engineer", "frontend_engineer", "workflow_engineer"}
+    requested: list[str] = []
+    raw_handoffs = payload.get("handoffs", [])
+    if not isinstance(raw_handoffs, list):
+        return requested
+    for item in raw_handoffs:
+        if isinstance(item, str):
+            target = item
+        elif isinstance(item, dict):
+            target = str(
+                item.get("to_role")
+                or item.get("target_role")
+                or item.get("role_id")
+                or item.get("to")
+                or ""
+            )
+        else:
+            continue
+        if target in build_roles and target != current_role_id and target not in requested:
+            requested.append(target)
+    return requested
 
 
 def provider_free_result(
@@ -403,6 +428,7 @@ def agent_result_from_reply(
     ]
     if not isinstance(payload.get("handoffs", []), list):
         parse_warnings.append("handoffs was not an array; deterministic handoffs used.")
+    requested_handoff_roles = _requested_build_handoffs(payload, role.role_id)
 
     build_roles = {"backend_engineer", "frontend_engineer", "workflow_engineer"}
     outward_without_patch = any(
@@ -429,6 +455,7 @@ def agent_result_from_reply(
         handoffs=_deterministic_handoffs(role, artifact_kind, summary),
         memory_writebacks=writeback_items,
         proposed_actions=proposed_actions,
+        requested_handoff_roles=requested_handoff_roles,
     )
 
 

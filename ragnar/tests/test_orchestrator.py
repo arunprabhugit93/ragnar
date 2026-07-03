@@ -113,6 +113,19 @@ def test_orchestrator_does_not_require_memory_provider() -> None:
     assert state.get("memory_context", []) == []
 
 
+def test_orchestrator_routes_html_page_typo_to_frontend() -> None:
+    state = run_objective(
+        "create a simple hello world html pag",
+        checkpoint_db=None,
+        memory_mode="off",
+    )
+    artifact_kinds = [artifact["kind"] for artifact in state["artifacts"]]
+
+    assert state["selected_build_roles"] == ["frontend_engineer"]
+    assert "frontend_work_packet" in artifact_kinds
+    assert "backend_work_packet" not in artifact_kinds
+
+
 def test_orchestrator_includes_agent_contract_and_writeback_format() -> None:
     state = run_objective(
         "fix the login bug",
@@ -331,6 +344,42 @@ def test_qa_revision_loop_routes_back_to_named_role() -> None:
     assert rework_feedback["conductor_feedback"] == "fix the auth check"
     assert rework_feedback["qa_commands"][0]["exit_code"] != 0
     assert state["qa_review_verdict"] == "approve"
+
+
+def test_blocked_build_role_handoff_routes_next_build_role() -> None:
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    orchestrator = RagnarOrchestrator(
+        registry,
+        config_path=Path("ragnar/ragnar.yaml"),
+        prepare_worktrees=False,
+        record_runs=False,
+    )
+    orchestrator.role_runtime = _ScriptedRoleRuntime(
+        {
+            ("backend_engineer", "edit_backend_worktree"): [
+                json.dumps(
+                    {
+                        "run_id": "run-test",
+                        "role_id": "backend_engineer",
+                        "status": "blocked",
+                        "summary": "HTML page work belongs to frontend_engineer.",
+                        "proposed_patches": [],
+                        "handoffs": [{"to": "frontend_engineer", "request": "Create the page."}],
+                        "memory_writebacks": [],
+                        "proposed_actions": [],
+                    }
+                )
+            ],
+        }
+    )
+
+    state = orchestrator.invoke("fix login and then create the page")
+    artifact_kinds = [artifact["kind"] for artifact in state["artifacts"]]
+    backend_packet = next(artifact for artifact in state["artifacts"] if artifact["kind"] == "backend_work_packet")
+
+    assert state["selected_build_roles"] == ["backend_engineer", "frontend_engineer"]
+    assert "frontend_work_packet" in artifact_kinds
+    assert backend_packet["body"]["requested_handoff_roles"] == ["frontend_engineer"]
 
 
 def test_final_report_includes_owner_briefing_offline() -> None:
