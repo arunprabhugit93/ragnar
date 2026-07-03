@@ -36,6 +36,9 @@ ragnar/.ragnar/letta_agents.json
 ```
 
 The manifest is used to avoid creating duplicate agents on repeated runs.
+Repeated runs also sync Ragnar-managed read-only memory blocks into existing
+agents, so role definition changes apply without deleting each agent's
+`working_lessons` memory.
 
 ## What Each Letta Agent Gets
 
@@ -44,12 +47,14 @@ Each role is created as:
 ```text
 name = ragnar__<role_id>
 tags = ragnar, role:<role_id>, team:<team>, memory:<private_namespace>
-model = RAGNAR_LETTA_MODEL or openai/gpt-4o-mini
-embedding = RAGNAR_LETTA_EMBEDDING or openai/text-embedding-3-small
-include_multi_agent_tools = true
+model = models.roles.<role_id>.model from ragnar.yaml, or RAGNAR_LETTA_MODEL when --no-config is used
+embedding = RAGNAR_LETTA_EMBEDDING or letta/letta-free
+include_multi_agent_tools = execution.enable_agent_messaging
 ```
 
-Each role receives four memory blocks:
+When `ragnar.yaml` is used, each role's model comes from `models.roles`.
+
+Each role receives five memory blocks:
 
 1. `persona`
    - Read-only.
@@ -63,14 +68,26 @@ Each role receives four memory blocks:
    - Read-only.
    - Private and shared memory namespaces this role is allowed to use.
 
-4. `working_lessons`
+4. `domain_stack_operating_model`
+   - Read-only.
+   - Defines the durable rule that the agent is domain and stack agnostic
+     inside its role boundary.
+   - Requires repo evidence or `project_profile` before making stack-specific
+     choices about language, framework, package manager, cloud, database,
+     folder layout, test command, or deployment surface.
+   - Requires stack/domain lessons to be stored with tags such as
+     `language:<name>`, `framework:<name>`, `domain:<name>`, and `role:<role_id>`.
+
+5. `working_lessons`
    - Writable.
    - The role's durable self-improvement memory.
    - Stores repo conventions, repeated mistakes, owner preferences, QA findings, and tool-use lessons.
 
 ## Communication
 
-Provisioned roles include Letta multi-agent tools, and are tagged by role and team. This gives us a base for:
+Provisioned roles include Letta multi-agent tools only when
+`execution.enable_agent_messaging` is true, and are tagged by role and team.
+This gives us a base for:
 
 - direct role-to-role handoffs by Letta agent ID
 - team broadcasts by tag

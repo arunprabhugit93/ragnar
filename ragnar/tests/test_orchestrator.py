@@ -12,6 +12,11 @@ from ragnar_core.chat import ChatSession, render_state
 from ragnar_core.config import ModelConfig, RagnarConfig, load_config
 from ragnar_core.contracts import build_invocation_contract
 from ragnar_core.edit_adapter import SafePatchAdapter, extract_changed_files
+from ragnar_core.letta_provisioner import (
+    ROLE_AGENT_DEFINITION_VERSION,
+    _memory_blocks,
+    _sync_agent_definition_blocks,
+)
 from ragnar_core.orchestrator import MAX_PLAN_REVISIONS, RagnarOrchestrator, run_objective
 from ragnar_core.pr_adapter import build_pr_draft
 from ragnar_core.role_registry import load_role_registry
@@ -493,3 +498,77 @@ def test_revision_caps_configurable_via_ragnar_config() -> None:
     default_config = RagnarConfig(version="0.1", raw={})
     assert default_config.max_plan_revisions(default=MAX_PLAN_REVISIONS) == MAX_PLAN_REVISIONS
     assert default_config.max_qa_revisions(default=2) == 2
+
+
+def test_letta_role_memory_defines_domain_stack_agnostic_operating_model() -> None:
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    role = registry.get("backend_engineer")
+
+    blocks = {block["label"]: block for block in _memory_blocks(role)}
+
+    operating_model = blocks["domain_stack_operating_model"]
+    assert operating_model["read_only"] is True
+    assert operating_model["metadata"]["definition_version"] == ROLE_AGENT_DEFINITION_VERSION
+    assert "Never assume the repo is Python" in operating_model["value"]
+    assert "project_profile" in operating_model["value"]
+    assert "language:<name>" in operating_model["value"]
+
+    persona = blocks["persona"]["value"]
+    assert "Follow the read-only domain_stack_operating_model memory block" in persona
+
+
+class _FakeBlockResponse:
+    def __init__(self, block_id: str) -> None:
+        self.id = block_id
+
+
+class _FakeAgentBlocksAPI:
+    def __init__(self) -> None:
+        self.updates: list[dict[str, Any]] = []
+        self.attachments: list[dict[str, str]] = []
+        self.fail_missing_labels: set[str] = set()
+
+    def update(self, label: str, *, agent_id: str, **kwargs: Any) -> None:
+        if label in self.fail_missing_labels:
+            raise RuntimeError("404 block not found")
+        self.updates.append({"label": label, "agent_id": agent_id, **kwargs})
+
+    def attach(self, block_id: str, *, agent_id: str) -> None:
+        self.attachments.append({"block_id": block_id, "agent_id": agent_id})
+
+
+class _FakeBlocksAPI:
+    def __init__(self) -> None:
+        self.created: list[dict[str, Any]] = []
+
+    def create(self, **kwargs: Any) -> _FakeBlockResponse:
+        self.created.append(kwargs)
+        return _FakeBlockResponse(f"block-{kwargs['label']}")
+
+
+class _FakeProvisionAgentsAPI:
+    def __init__(self) -> None:
+        self.blocks = _FakeAgentBlocksAPI()
+
+
+class _FakeProvisionClient:
+    def __init__(self) -> None:
+        self.agents = _FakeProvisionAgentsAPI()
+        self.blocks = _FakeBlocksAPI()
+
+
+def test_existing_letta_agent_definition_blocks_are_synced() -> None:
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    role = registry.get("frontend_engineer")
+    client = _FakeProvisionClient()
+    client.agents.blocks.fail_missing_labels = {"domain_stack_operating_model"}
+
+    _sync_agent_definition_blocks(client, "agent-frontend", role)
+
+    updated_labels = {item["label"] for item in client.agents.blocks.updates}
+    assert {"persona", "role_contract", "memory_scope"}.issubset(updated_labels)
+    assert client.blocks.created[0]["label"] == "domain_stack_operating_model"
+    assert client.blocks.created[0]["read_only"] is True
+    assert client.agents.blocks.attachments == [
+        {"block_id": "block-domain_stack_operating_model", "agent_id": "agent-frontend"}
+    ]

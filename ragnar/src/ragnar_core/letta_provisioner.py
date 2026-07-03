@@ -14,6 +14,7 @@ from .role_registry import RoleContract, load_role_registry
 
 DEFAULT_MODEL = "letta/letta-free"
 DEFAULT_EMBEDDING = "letta/letta-free"
+ROLE_AGENT_DEFINITION_VERSION = "2026-07-03.domain-stack-agnostic-v1"
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,7 @@ class ProvisionedAgent:
     private_memory_namespace: str
     tags: list[str]
     model: str
+    role_definition_version: str = ROLE_AGENT_DEFINITION_VERSION
 
 
 def _repo_root() -> Path:
@@ -89,6 +91,11 @@ Sends handoffs to:
 Iron Rule:
 Reads and research run free. Every outward action waits for owner approval.
 
+Domain and stack operating model:
+Follow the read-only domain_stack_operating_model memory block. Your role is
+defined by responsibility and authority, not by a fixed domain, language,
+framework, package manager, cloud, database, folder layout, or test runner.
+
 You must preserve role-specific lessons in memory after useful work, especially:
 - project conventions discovered
 - repeated mistakes
@@ -98,6 +105,76 @@ You must preserve role-specific lessons in memory after useful work, especially:
 - tool-use lessons
 
 Never claim an outward action happened unless the approval broker granted it.
+"""
+
+
+def _domain_stack_operating_model(role: RoleContract) -> str:
+    role_scope = "\n".join(f"- {item}" for item in role.responsibility) or "- Follow this role's responsibility list."
+    authority = "\n".join(f"- {item}" for item in role.authority.get("can", [])) or "- none"
+    denied = "\n".join(f"- {item}" for item in role.authority.get("cannot", [])) or "- none"
+    approvals = "\n".join(f"- {item}" for item in role.authority.get("requires_approval", [])) or "- none"
+    surface = role.isolation.get("surface", "general")
+
+    return f"""Ragnar domain/stack operating model for {role.role_id}
+Version: {ROLE_AGENT_DEFINITION_VERSION}
+
+Identity:
+You are a durable specialist for the {role.role_id} role. Your expertise is
+defined by this role's responsibilities and authority, not by any fixed product
+domain or technology stack.
+
+Role scope:
+{role_scope}
+
+Authority you may exercise:
+{authority}
+
+Authority requiring owner approval:
+{approvals}
+
+Denied authority:
+{denied}
+
+Primary surface:
+- {surface}
+
+Non-assumption rule:
+Never assume the repo is Python, JavaScript, TypeScript, Java, Go, Rust, PHP,
+Ruby, .NET, mobile, monolith, microservice, serverless, Kubernetes, Docker,
+AWS, Azure, GCP, SQL, NoSQL, React, Next.js, Django, FastAPI, Express, Spring,
+Laravel, Rails, or any other stack unless repo evidence or an explicit
+project_profile says so.
+
+Discovery rule:
+Before making stack-specific decisions, ground yourself in evidence from the
+project_profile and repository artifacts: manifests, lockfiles, framework
+configuration, source tree, CI, Docker/infra files, migration folders, test
+config, package scripts, Makefiles, README/runbooks, and existing code style.
+If evidence is missing or contradictory, say what discovery is needed instead
+of inventing the stack.
+
+Domain rule:
+Do not assume the business domain. Infer domain only from project_profile,
+requirements, data model names, UI copy, tests, issue text, or owner-provided
+context. Keep domain assumptions explicit and confidence-scored.
+
+Adaptation rule:
+Produce outputs in the native idioms of the discovered stack: file locations,
+patch shape, naming conventions, test command, dependency manager, migration
+style, build command, and deployment surface must follow repo evidence. If no
+safe stack-specific action is supported by the evidence, return a discovery or
+clarification plan instead of a fabricated implementation.
+
+Memory rule:
+When saving durable lessons, tag them with observable dimensions when known:
+language:<name>, framework:<name>, domain:<name>, repo:<name>, tool:<name>,
+and role:{role.role_id}. Do not convert one project's stack-specific lesson
+into a universal rule unless repeated evidence supports it.
+
+Boundary rule:
+Stay inside this role's authority even when the discovered stack suggests
+adjacent work. Use handoffs for adjacent responsibilities and proposed_actions
+for outward actions that require owner approval.
 """
 
 
@@ -125,6 +202,17 @@ def _memory_blocks(role: RoleContract) -> list[dict[str, Any]]:
             "read_only": True,
         },
         {
+            "label": "domain_stack_operating_model",
+            "value": _domain_stack_operating_model(role),
+            "read_only": True,
+            "metadata": {
+                "system": "ragnar",
+                "role_id": role.role_id,
+                "definition_version": ROLE_AGENT_DEFINITION_VERSION,
+                "purpose": "Keep this durable role stack/domain agnostic inside Letta memory.",
+            },
+        },
+        {
             "label": "memory_scope",
             "value": json.dumps(role.memory, indent=2),
             "read_only": True,
@@ -147,6 +235,40 @@ def _tags(role: RoleContract) -> list[str]:
         f"team:{role.team}",
         f"memory:{role.private_memory_namespace}",
     ]
+
+
+def _readonly_definition_blocks(role: RoleContract) -> list[dict[str, Any]]:
+    return [block for block in _memory_blocks(role) if block.get("read_only")]
+
+
+def _block_payload(block: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in block.items()
+        if key in {"label", "value", "read_only", "metadata"} and value is not None
+    }
+
+
+def _sync_agent_definition_blocks(client: Any, agent_id: str, role: RoleContract) -> None:
+    """Make an existing durable Letta agent match Ragnar's current role definition.
+
+    Mutable blocks such as working_lessons are intentionally not touched.
+    """
+
+    for block in _readonly_definition_blocks(role):
+        payload = _block_payload(block)
+        label = str(payload.pop("label"))
+        try:
+            client.agents.blocks.update(label, agent_id=agent_id, **payload)
+            continue
+        except Exception as update_exc:
+            message = str(update_exc).lower()
+            if "not found" not in message and "404" not in message:
+                raise
+
+        created = client.blocks.create(label=label, **payload)
+        block_id = str(getattr(created, "id"))
+        client.agents.blocks.attach(block_id, agent_id=agent_id)
 
 
 def _load_manifest(path: Path) -> dict[str, Any]:
@@ -209,14 +331,20 @@ def create_or_reuse_agents(
     for role in registry.all():
         existing = agents_manifest.get(role.role_id)
         if existing and existing.get("letta_agent_id"):
+            _sync_agent_definition_blocks(client, existing["letta_agent_id"], role)
+            existing["tags"] = _tags(role)
+            existing["model"] = model_for(role.role_id)
+            existing["role_definition_version"] = ROLE_AGENT_DEFINITION_VERSION
+            agents_manifest[role.role_id] = existing
+            _save_manifest(manifest_path, manifest)
             provisioned.append(
                 ProvisionedAgent(
                     role_id=role.role_id,
                     display_name=role.display_name,
                     letta_agent_id=existing["letta_agent_id"],
                     private_memory_namespace=role.private_memory_namespace,
-                    tags=existing.get("tags", _tags(role)),
-                    model=existing.get("model", model_for(role.role_id)),
+                    tags=_tags(role),
+                    model=model_for(role.role_id),
                 )
             )
             continue
@@ -233,6 +361,7 @@ def create_or_reuse_agents(
                 "role_id": role.role_id,
                 "team": role.team,
                 "private_memory_namespace": role.private_memory_namespace,
+                "role_definition_version": ROLE_AGENT_DEFINITION_VERSION,
             },
         }
         if communication_tools:
