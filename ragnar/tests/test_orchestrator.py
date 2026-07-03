@@ -23,7 +23,7 @@ from ragnar_core.pr_adapter import build_pr_draft
 from ragnar_core.project_profiler import build_project_profile, qa_commands_from_profile
 from ragnar_core.role_registry import load_role_registry
 from ragnar_core.role_runtime import RoleRuntime, RoleRuntimeResult
-from ragnar_core.workspace import RoleWorkspaceManager
+from ragnar_core.workspace import RoleWorkspaceManager, command_family, default_workspace_policies
 
 
 class _ScriptedRoleRuntime:
@@ -629,6 +629,32 @@ def test_qa_commands_from_profile_only_maps_allowlisted_strings() -> None:
     assert [sys.executable, "-m", "pytest"] in commands
     assert ["go", "test", "./..."] in commands
     assert not any("rm" in " ".join(command) for command in commands)
+
+
+def test_all_profile_qa_commands_are_allowed_by_qa_policy() -> None:
+    qa_policy = default_workspace_policies()["qa_engineer"]
+    commands = qa_commands_from_profile(
+        {
+            "test_commands": [
+                "pytest",
+                "python -m unittest",
+                "npm test",
+                "yarn test",
+                "pnpm test",
+                "go test ./...",
+                "cargo test",
+                "mvn test",
+                "gradle test",
+                "bundle exec rspec",
+                "rake test",
+                "composer test",
+            ]
+        }
+    )
+
+    denied = [command for command in commands if command_family(command) not in qa_policy.allowed_command_families]
+
+    assert denied == []
 
 
 def test_project_profiler_runs_before_triage_and_populates_state(tmp_path: Path) -> None:

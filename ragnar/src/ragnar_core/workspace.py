@@ -116,6 +116,7 @@ def default_workspace_policies() -> dict[str, RoleWorkspacePolicy]:
             allowed_command_families=[
                 "python -m compileall",
                 "python -m pytest",
+                "python -m unittest",
                 "pytest",
                 "ruff",
                 "mypy",
@@ -189,6 +190,7 @@ def default_workspace_policies() -> dict[str, RoleWorkspacePolicy]:
             allowed_command_families=[
                 "python -m compileall",
                 "python -m pytest",
+                "python -m unittest",
                 "pytest",
                 "ruff",
                 "mypy",
