@@ -9,9 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from ragnar_core.agent_transcripts import AgentTranscriptStore
-from ragnar_core.approval_store import ApprovalStore, default_approvals_path
+from ragnar_core.approval_store import ApprovalStore
 from ragnar_core.chat import ChatSession, render_state
-from ragnar_core.config import ModelConfig, RagnarConfig, load_config, repo_root
+from ragnar_core.config import ModelConfig, RagnarConfig, load_config
 from ragnar_core.conductor_decision import make_conductor_decision
 from ragnar_core.context_broker import ContextBroker, ContextBudget
 from ragnar_core.contracts import MemoryWriteback, agent_result_from_reply, build_invocation_contract, provider_error_result
@@ -96,21 +96,21 @@ class _FakeMemoryProvider:
         ]
 
 
-def _approve_plan(run_id: str) -> None:
+def _approve_plan(approvals_path: Path, run_id: str) -> None:
     """Pre-approve plan_approval_gate's start_build_phase, same as an owner
     running `/approve <run_id> conductor start_build_phase` before a rerun."""
-    ApprovalStore(default_approvals_path(repo_root())).record(
-        run_id, "conductor", "start_build_phase", "approved", "test pre-approval"
-    )
+    ApprovalStore(approvals_path).record(run_id, "conductor", "start_build_phase", "approved", "test pre-approval")
 
 
-def test_orchestrator_routes_all_build_roles() -> None:
+def test_orchestrator_routes_all_build_roles(tmp_path: Path) -> None:
     run_id = "test-routes-all-build-roles"
-    _approve_plan(run_id)
+    approvals_path = tmp_path / "approvals.jsonl"
+    _approve_plan(approvals_path, run_id)
     state = run_objective(
         "build a frontend settings page with backend API and webhook integration",
         checkpoint_db=None,
         run_id=run_id,
+        approvals_path=approvals_path,
     )
 
     assert state["selected_build_roles"] == [
@@ -122,10 +122,11 @@ def test_orchestrator_routes_all_build_roles() -> None:
     assert state.get("approval_requests", []) == []
 
 
-def test_orchestrator_uses_backend_default_and_keeps_qa_gate() -> None:
+def test_orchestrator_uses_backend_default_and_keeps_qa_gate(tmp_path: Path) -> None:
     run_id = "test-backend-default-qa-gate"
-    _approve_plan(run_id)
-    state = run_objective("fix the login bug", checkpoint_db=None, run_id=run_id)
+    approvals_path = tmp_path / "approvals.jsonl"
+    _approve_plan(approvals_path, run_id)
+    state = run_objective("fix the login bug", checkpoint_db=None, run_id=run_id, approvals_path=approvals_path)
     artifact_kinds = [artifact["kind"] for artifact in state["artifacts"]]
 
     assert state["selected_build_roles"] == ["backend_engineer"]
@@ -134,14 +135,16 @@ def test_orchestrator_uses_backend_default_and_keeps_qa_gate() -> None:
     assert state["phase"] == "approved_to_finish"
 
 
-def test_orchestrator_runs_configured_qa_command() -> None:
+def test_orchestrator_runs_configured_qa_command(tmp_path: Path) -> None:
     run_id = "test-runs-configured-qa-command"
-    _approve_plan(run_id)
+    approvals_path = tmp_path / "approvals.jsonl"
+    _approve_plan(approvals_path, run_id)
     state = run_objective(
         "fix the database migration",
         checkpoint_db=None,
         qa_commands=[[sys.executable, "-m", "compileall", "-q", "src/ragnar_core"]],
         run_id=run_id,
+        approvals_path=approvals_path,
     )
     qa_artifact = next(artifact for artifact in state["artifacts"] if artifact["kind"] == "qa_verdict")
 
@@ -464,11 +467,12 @@ def test_plan_approval_gate_skipped_when_no_plan_produced() -> None:
     assert "backend_work_packet" in [artifact["kind"] for artifact in state["artifacts"]]
 
 
-def test_plan_approval_gate_blocks_then_proceeds_after_owner_approval() -> None:
+def test_plan_approval_gate_blocks_then_proceeds_after_owner_approval(tmp_path: Path) -> None:
     run_id = "test-plan-approval-gate-blocks-then-proceeds"
     objective = "fix the login bug"
+    approvals_path = tmp_path / "approvals.jsonl"
 
-    blocked_state = run_objective(objective, checkpoint_db=None, run_id=run_id)
+    blocked_state = run_objective(objective, checkpoint_db=None, run_id=run_id, approvals_path=approvals_path)
 
     assert blocked_state["execution_mode"] == "governed_path"
     assert blocked_state["phase"] == "awaiting_plan_approval"
@@ -486,8 +490,8 @@ def test_plan_approval_gate_blocks_then_proceeds_after_owner_approval() -> None:
     assert "architecture_plan" in artifact_kinds
     assert "backend_work_packet" not in artifact_kinds
 
-    _approve_plan(run_id)
-    approved_state = run_objective(objective, checkpoint_db=None, run_id=run_id)
+    _approve_plan(approvals_path, run_id)
+    approved_state = run_objective(objective, checkpoint_db=None, run_id=run_id, approvals_path=approvals_path)
 
     assert approved_state["phase"] != "awaiting_plan_approval"
     artifact_kinds = [artifact["kind"] for artifact in approved_state["artifacts"]]
@@ -671,13 +675,14 @@ def test_near_duplicate_consolidation_skips_noise_but_keeps_qa_findings_and_deci
     assert classifications.count("project_context") == 1
 
 
-def test_role_context_carries_prior_role_handoff_without_full_repeat() -> None:
+def test_role_context_carries_prior_role_handoff_without_full_repeat(tmp_path: Path) -> None:
     registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
     orchestrator = RagnarOrchestrator(
         registry,
         config_path=Path("ragnar/ragnar.yaml"),
         prepare_worktrees=True,
         record_runs=False,
+        approvals_path=tmp_path / "approvals.jsonl",
     )
     runtime = _ScriptedRoleRuntime(
         {
@@ -706,7 +711,7 @@ def test_role_context_carries_prior_role_handoff_without_full_repeat() -> None:
     orchestrator.role_runtime = runtime
 
     run_id = "test-role-context-handoff"
-    _approve_plan(run_id)
+    _approve_plan(orchestrator.approval_store.path, run_id)
     orchestrator.invoke("build backend API and frontend page", run_id=run_id)
     frontend_invocation = next(item for item in runtime.invocations if item and item.role_id == "frontend_engineer")
 
@@ -715,14 +720,16 @@ def test_role_context_carries_prior_role_handoff_without_full_repeat() -> None:
     assert "GET /api/profile" in frontend_invocation.handoff_inputs[0]["summary"]
 
 
-def test_orchestrator_includes_agent_contract_and_writeback_format() -> None:
+def test_orchestrator_includes_agent_contract_and_writeback_format(tmp_path: Path) -> None:
     run_id = "test-agent-contract-writeback"
-    _approve_plan(run_id)
+    approvals_path = tmp_path / "approvals.jsonl"
+    _approve_plan(approvals_path, run_id)
     state = run_objective(
         "fix the login bug",
         checkpoint_db=None,
         memory_mode="off",
         run_id=run_id,
+        approvals_path=approvals_path,
     )
     packet = next(artifact for artifact in state["artifacts"] if artifact["kind"] == "backend_work_packet")
 
@@ -733,14 +740,16 @@ def test_orchestrator_includes_agent_contract_and_writeback_format() -> None:
     assert packet["body"]["memory_writebacks"][0]["scope"] == "private"
 
 
-def test_qa_rejects_disallowed_command() -> None:
+def test_qa_rejects_disallowed_command(tmp_path: Path) -> None:
     run_id = "test-qa-rejects-disallowed-command"
-    _approve_plan(run_id)
+    approvals_path = tmp_path / "approvals.jsonl"
+    _approve_plan(approvals_path, run_id)
     state = run_objective(
         "fix the database migration",
         checkpoint_db=None,
         qa_commands=[[sys.executable, "-c", "print('not allowed')"]],
         run_id=run_id,
+        approvals_path=approvals_path,
     )
     qa_artifact = next(artifact for artifact in state["artifacts"] if artifact["kind"] == "qa_verdict")
 
@@ -931,10 +940,11 @@ def test_architect_plan_produces_real_agent_artifact_shape_offline() -> None:
     assert plan_artifact["body"]["agent_result"]["status"] == "no_provider"
 
 
-def test_conductor_review_plan_defaults_to_approve_offline() -> None:
+def test_conductor_review_plan_defaults_to_approve_offline(tmp_path: Path) -> None:
     run_id = "test-conductor-review-plan-approve"
-    _approve_plan(run_id)
-    state = run_objective("fix the login bug", checkpoint_db=None, run_id=run_id)
+    approvals_path = tmp_path / "approvals.jsonl"
+    _approve_plan(approvals_path, run_id)
+    state = run_objective("fix the login bug", checkpoint_db=None, run_id=run_id, approvals_path=approvals_path)
 
     assert state["plan_review_verdict"] == "approve"
     assert state["plan_revision_count"] == 0
@@ -943,10 +953,11 @@ def test_conductor_review_plan_defaults_to_approve_offline() -> None:
     assert "backend_work_packet" in artifact_kinds
 
 
-def test_conductor_review_qa_defaults_to_approve_offline() -> None:
+def test_conductor_review_qa_defaults_to_approve_offline(tmp_path: Path) -> None:
     run_id = "test-conductor-review-qa-approve"
-    _approve_plan(run_id)
-    state = run_objective("fix the login bug", checkpoint_db=None, run_id=run_id)
+    approvals_path = tmp_path / "approvals.jsonl"
+    _approve_plan(approvals_path, run_id)
+    state = run_objective("fix the login bug", checkpoint_db=None, run_id=run_id, approvals_path=approvals_path)
 
     assert state["qa_review_verdict"] == "approve"
     assert state["qa_rework_roles"] == []
@@ -1032,7 +1043,7 @@ def test_conductor_review_reuses_cached_verdict_when_subject_unchanged(tmp_path:
     assert len(scripted.invocations) == 2
 
 
-def test_qa_revision_loop_routes_back_to_named_role() -> None:
+def test_qa_revision_loop_routes_back_to_named_role(tmp_path: Path) -> None:
     registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
     orchestrator = RagnarOrchestrator(
         registry,
@@ -1040,6 +1051,7 @@ def test_qa_revision_loop_routes_back_to_named_role() -> None:
         prepare_worktrees=False,
         record_runs=False,
         qa_commands=[[sys.executable, "-m", "pytest", "-q", "/nonexistent-test-file-xyz.py"]],
+        approvals_path=tmp_path / "approvals.jsonl",
     )
     orchestrator.role_runtime = _ScriptedRoleRuntime(
         {
@@ -1051,7 +1063,7 @@ def test_qa_revision_loop_routes_back_to_named_role() -> None:
     )
 
     run_id = "test-qa-revision-loop"
-    _approve_plan(run_id)
+    _approve_plan(orchestrator.approval_store.path, run_id)
     state = orchestrator.invoke("fix the login bug", run_id=run_id)
 
     backend_packets = [a for a in state["artifacts"] if a["kind"] == "backend_work_packet"]
@@ -1062,13 +1074,14 @@ def test_qa_revision_loop_routes_back_to_named_role() -> None:
     assert state["qa_review_verdict"] == "approve"
 
 
-def test_blocked_build_role_handoff_routes_next_build_role() -> None:
+def test_blocked_build_role_handoff_routes_next_build_role(tmp_path: Path) -> None:
     registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
     orchestrator = RagnarOrchestrator(
         registry,
         config_path=Path("ragnar/ragnar.yaml"),
         prepare_worktrees=False,
         record_runs=False,
+        approvals_path=tmp_path / "approvals.jsonl",
     )
     orchestrator.role_runtime = _ScriptedRoleRuntime(
         {
@@ -1090,7 +1103,7 @@ def test_blocked_build_role_handoff_routes_next_build_role() -> None:
     )
 
     run_id = "test-blocked-build-role-handoff"
-    _approve_plan(run_id)
+    _approve_plan(orchestrator.approval_store.path, run_id)
     state = orchestrator.invoke("fix login and then create the page", run_id=run_id)
     artifact_kinds = [artifact["kind"] for artifact in state["artifacts"]]
     backend_packet = next(artifact for artifact in state["artifacts"] if artifact["kind"] == "backend_work_packet")

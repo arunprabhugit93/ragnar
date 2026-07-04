@@ -429,7 +429,10 @@ class RagnarOrchestrator:
                 execution_profile="standard_path",
                 architect_required=profile.use_architect,
                 review_required=profile.use_conductor_plan_review or profile.use_conductor_qa_review == "always",
-                inter_agent_comm_required=profile.allow_inter_agent_chat and len(selected_roles) > 1,
+                # Matches conductor_decision.py's own formula: every profile allows
+                # inter-agent chat now, unconditionally -- a single-role run can still
+                # consult a peer, so this must not re-gate on role count.
+                inter_agent_comm_required=profile.allow_inter_agent_chat,
                 reason="Fast path disabled by configuration; using standard path.",
                 budgets={
                     "max_agent_calls": profile.max_agent_calls,
@@ -786,6 +789,11 @@ class RagnarOrchestrator:
             # its unified diff never actually applied (git apply --check failure). QA
             # must not let that silently pass as if the work landed.
             or artifact.get("body", {}).get("patch_apply_failed")
+            # A role skipped due to agent-call budget exhaustion gets a "no_provider"
+            # agent_result -- the same status benign offline stubs use -- so it would
+            # otherwise slip past this filter as if the role had simply run offline
+            # rather than been skipped entirely.
+            or artifact.get("body", {}).get("budget_exhausted")
         ]
         failed_packet_facts = [
             {
@@ -794,6 +802,7 @@ class RagnarOrchestrator:
                 "status": (artifact.get("body", {}).get("agent_result", {}) or {}).get("status"),
                 "summary": (artifact.get("body", {}).get("agent_result", {}) or {}).get("summary"),
                 "patch_apply_failed": bool(artifact.get("body", {}).get("patch_apply_failed")),
+                "budget_exhausted": bool(artifact.get("body", {}).get("budget_exhausted")),
             }
             for artifact in failed_packets
         ]
@@ -1528,6 +1537,7 @@ class RagnarOrchestrator:
             "memory_writebacks": [writeback.to_dict() for writeback in agent_result.memory_writebacks],
             "patch_reports": patch_reports,
             "patch_apply_failed": patch_apply_failed,
+            "budget_exhausted": runtime_result.status == "budget_exhausted",
             "rejected_actions": rejected_actions,
             "notes": notes,
         }
@@ -1665,6 +1675,22 @@ class RagnarOrchestrator:
         )
         if runtime_result.raw_reply is not None:
             review = review_result_from_reply(state["run_id"], conductor, runtime_result.raw_reply)
+        elif runtime_result.status == "budget_exhausted":
+            # Distinct from the true offline/no-provider fallback below: the run is
+            # online, this review was simply skipped because it hit the per-run
+            # call ceiling. Defaulting to "approve" here would let a real failure
+            # silently sail through on a non-answer -- "revise" instead feeds the
+            # same revision-count/escalation machinery, so repeated exhaustion
+            # eventually escalates to a real gated owner approval instead of a
+            # rubber-stamped pass.
+            review = RoleReviewResult(
+                schema_version=SCHEMA_VERSION,
+                run_id=state["run_id"],
+                role_id=conductor.role_id,
+                verdict="revise",
+                feedback=runtime_result.message,
+                rework_roles=[],
+            )
         else:
             review = RoleReviewResult(
                 schema_version=SCHEMA_VERSION,
@@ -1878,6 +1904,7 @@ def run_objective(
     prepare_worktrees: bool = False,
     config_path: Path | None = None,
     role_runtime_mode: RoleRuntimeMode = "offline",
+    approvals_path: Path | None = None,
 ) -> RagnarState:
     registry = load_role_registry(roles_path or _default_roles_path())
     orchestrator = RagnarOrchestrator(
@@ -1888,6 +1915,7 @@ def run_objective(
         prepare_worktrees=prepare_worktrees,
         config_path=config_path,
         role_runtime_mode=role_runtime_mode,
+        approvals_path=approvals_path,
     )
     return orchestrator.invoke(objective, checkpoint_db=checkpoint_db, run_id=run_id)
 

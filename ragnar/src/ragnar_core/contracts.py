@@ -533,7 +533,9 @@ def compact_contract_json(contract: RoleInvocationContract) -> str:
             "available": contract.workspace.get("available"),
             "status": contract.workspace.get("status"),
             "worktree_path": contract.workspace.get("worktree_path"),
-            "reviewed_worktrees": contract.workspace.get("reviewed_worktrees"),
+            # reviewed_worktrees deliberately omitted -- qa_gate no longer sets it on
+            # workspace (moved to observed_facts, part of memory_context above) to
+            # avoid sending the same diff data twice; this key would always be None.
         },
         "allowed_path_globs": contract.file_policy.get("allowed_path_globs", []),
         "allowed_command_families": contract.command_policy.get("allowed_command_families", []),

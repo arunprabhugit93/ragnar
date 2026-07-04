@@ -49,9 +49,19 @@ class MemoryWritebackStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         existing = self.list()
         seen = {record.get("fingerprint") for record in existing}
-        recent_texts_by_scope: dict[tuple[str, str, str], list[str]] = {}
+        # Keyed by classification too, not just (namespace, scope, role_id) -- otherwise
+        # an excluded-classification entry (qa_finding/decision/role_lesson) sitting in
+        # the same namespace/role/scope would still enter the comparison pool and could
+        # silently suppress a genuinely new, eligible-classification writeback that
+        # happens to be textually similar to it.
+        recent_texts_by_scope: dict[tuple[str, str, str, str], list[str]] = {}
         for record in existing:
-            key = (str(record.get("namespace")), str(record.get("scope")), str(record.get("role_id")))
+            key = (
+                str(record.get("namespace")),
+                str(record.get("scope")),
+                str(record.get("role_id")),
+                str(record.get("classification")),
+            )
             recent_texts_by_scope.setdefault(key, []).append(str(record.get("text", "")))
         count = 0
         with self.path.open("a", encoding="utf-8") as handle:
@@ -59,7 +69,7 @@ class MemoryWritebackStore:
                 curated = curate_writeback(record)
                 if curated is None or curated["fingerprint"] in seen:
                     continue
-                key = (str(curated["namespace"]), str(curated["scope"]), str(curated["role_id"]))
+                key = (str(curated["namespace"]), str(curated["scope"]), str(curated["role_id"]), str(curated["classification"]))
                 recent_texts = recent_texts_by_scope.setdefault(key, [])
                 if curated["classification"] in _NEAR_DUPLICATE_ELIGIBLE_CLASSIFICATIONS and _is_near_duplicate(
                     curated["text"], recent_texts
