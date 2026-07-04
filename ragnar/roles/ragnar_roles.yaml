@@ -24,6 +24,8 @@ roles:
         - request_approval
         - review_delivery_plan
         - review_qa_verdict
+      requires_approval:
+        - start_build_phase
       cannot:
         - approve_own_work
         - push_code

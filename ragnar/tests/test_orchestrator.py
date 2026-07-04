@@ -9,8 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from ragnar_core.agent_transcripts import AgentTranscriptStore
+from ragnar_core.approval_store import ApprovalStore, default_approvals_path
 from ragnar_core.chat import ChatSession, render_state
-from ragnar_core.config import ModelConfig, RagnarConfig, load_config
+from ragnar_core.config import ModelConfig, RagnarConfig, load_config, repo_root
 from ragnar_core.conductor_decision import make_conductor_decision
 from ragnar_core.context_broker import ContextBroker, ContextBudget
 from ragnar_core.contracts import MemoryWriteback, agent_result_from_reply, build_invocation_contract, provider_error_result
@@ -95,10 +96,21 @@ class _FakeMemoryProvider:
         ]
 
 
+def _approve_plan(run_id: str) -> None:
+    """Pre-approve plan_approval_gate's start_build_phase, same as an owner
+    running `/approve <run_id> conductor start_build_phase` before a rerun."""
+    ApprovalStore(default_approvals_path(repo_root())).record(
+        run_id, "conductor", "start_build_phase", "approved", "test pre-approval"
+    )
+
+
 def test_orchestrator_routes_all_build_roles() -> None:
+    run_id = "test-routes-all-build-roles"
+    _approve_plan(run_id)
     state = run_objective(
         "build a frontend settings page with backend API and webhook integration",
         checkpoint_db=None,
+        run_id=run_id,
     )
 
     assert state["selected_build_roles"] == [
@@ -111,7 +123,9 @@ def test_orchestrator_routes_all_build_roles() -> None:
 
 
 def test_orchestrator_uses_backend_default_and_keeps_qa_gate() -> None:
-    state = run_objective("fix the login bug", checkpoint_db=None)
+    run_id = "test-backend-default-qa-gate"
+    _approve_plan(run_id)
+    state = run_objective("fix the login bug", checkpoint_db=None, run_id=run_id)
     artifact_kinds = [artifact["kind"] for artifact in state["artifacts"]]
 
     assert state["selected_build_roles"] == ["backend_engineer"]
@@ -121,10 +135,13 @@ def test_orchestrator_uses_backend_default_and_keeps_qa_gate() -> None:
 
 
 def test_orchestrator_runs_configured_qa_command() -> None:
+    run_id = "test-runs-configured-qa-command"
+    _approve_plan(run_id)
     state = run_objective(
         "fix the database migration",
         checkpoint_db=None,
         qa_commands=[[sys.executable, "-m", "compileall", "-q", "src/ragnar_core"]],
+        run_id=run_id,
     )
     qa_artifact = next(artifact for artifact in state["artifacts"] if artifact["kind"] == "qa_verdict")
 
@@ -293,6 +310,52 @@ def test_standard_path_skips_architect_and_conductor_reviews_by_default() -> Non
     assert "conductor_qa_review" not in artifact_kinds
 
 
+def test_plan_approval_gate_skipped_when_no_plan_produced() -> None:
+    state = run_objective(
+        "update backend service logging",
+        checkpoint_db=None,
+        memory_mode="off",
+        prepare_worktrees=False,
+        record_runs=False,
+    )
+
+    assert state["execution_mode"] == "standard_path"
+    assert state["phase"] != "awaiting_plan_approval"
+    assert state.get("approval_requests", []) == []
+    assert "backend_work_packet" in [artifact["kind"] for artifact in state["artifacts"]]
+
+
+def test_plan_approval_gate_blocks_then_proceeds_after_owner_approval() -> None:
+    run_id = "test-plan-approval-gate-blocks-then-proceeds"
+    objective = "fix the login bug"
+
+    blocked_state = run_objective(objective, checkpoint_db=None, run_id=run_id)
+
+    assert blocked_state["execution_mode"] == "governed_path"
+    assert blocked_state["phase"] == "awaiting_plan_approval"
+    assert blocked_state["blocked"] is True
+    assert blocked_state["approval_requests"] == [
+        {
+            "role_id": "conductor",
+            "action": "start_build_phase",
+            "reason": blocked_state["approval_requests"][0]["reason"],
+            "requested_at": blocked_state["approval_requests"][0]["requested_at"],
+            "status": "pending_owner_approval",
+        }
+    ]
+    artifact_kinds = [artifact["kind"] for artifact in blocked_state["artifacts"]]
+    assert "architecture_plan" in artifact_kinds
+    assert "backend_work_packet" not in artifact_kinds
+
+    _approve_plan(run_id)
+    approved_state = run_objective(objective, checkpoint_db=None, run_id=run_id)
+
+    assert approved_state["phase"] != "awaiting_plan_approval"
+    artifact_kinds = [artifact["kind"] for artifact in approved_state["artifacts"]]
+    assert "backend_work_packet" in artifact_kinds
+    assert "qa_verdict" in artifact_kinds
+
+
 def test_planning_only_uses_architect_and_finishes_without_build_roles() -> None:
     state = run_objective(
         "design the architecture for a monitoring platform",
@@ -427,7 +490,9 @@ def test_role_context_carries_prior_role_handoff_without_full_repeat() -> None:
     )
     orchestrator.role_runtime = runtime
 
-    orchestrator.invoke("build backend API and frontend page")
+    run_id = "test-role-context-handoff"
+    _approve_plan(run_id)
+    orchestrator.invoke("build backend API and frontend page", run_id=run_id)
     frontend_invocation = next(item for item in runtime.invocations if item and item.role_id == "frontend_engineer")
 
     assert frontend_invocation.handoff_inputs[0]["from_role"] == "backend_engineer"
@@ -436,10 +501,13 @@ def test_role_context_carries_prior_role_handoff_without_full_repeat() -> None:
 
 
 def test_orchestrator_includes_agent_contract_and_writeback_format() -> None:
+    run_id = "test-agent-contract-writeback"
+    _approve_plan(run_id)
     state = run_objective(
         "fix the login bug",
         checkpoint_db=None,
         memory_mode="off",
+        run_id=run_id,
     )
     packet = next(artifact for artifact in state["artifacts"] if artifact["kind"] == "backend_work_packet")
 
@@ -451,10 +519,13 @@ def test_orchestrator_includes_agent_contract_and_writeback_format() -> None:
 
 
 def test_qa_rejects_disallowed_command() -> None:
+    run_id = "test-qa-rejects-disallowed-command"
+    _approve_plan(run_id)
     state = run_objective(
         "fix the database migration",
         checkpoint_db=None,
         qa_commands=[[sys.executable, "-c", "print('not allowed')"]],
+        run_id=run_id,
     )
     qa_artifact = next(artifact for artifact in state["artifacts"] if artifact["kind"] == "qa_verdict")
 
@@ -646,7 +717,9 @@ def test_architect_plan_produces_real_agent_artifact_shape_offline() -> None:
 
 
 def test_conductor_review_plan_defaults_to_approve_offline() -> None:
-    state = run_objective("fix the login bug", checkpoint_db=None)
+    run_id = "test-conductor-review-plan-approve"
+    _approve_plan(run_id)
+    state = run_objective("fix the login bug", checkpoint_db=None, run_id=run_id)
 
     assert state["plan_review_verdict"] == "approve"
     assert state["plan_revision_count"] == 0
@@ -656,7 +729,9 @@ def test_conductor_review_plan_defaults_to_approve_offline() -> None:
 
 
 def test_conductor_review_qa_defaults_to_approve_offline() -> None:
-    state = run_objective("fix the login bug", checkpoint_db=None)
+    run_id = "test-conductor-review-qa-approve"
+    _approve_plan(run_id)
+    state = run_objective("fix the login bug", checkpoint_db=None, run_id=run_id)
 
     assert state["qa_review_verdict"] == "approve"
     assert state["qa_rework_roles"] == []
@@ -709,7 +784,9 @@ def test_qa_revision_loop_routes_back_to_named_role() -> None:
         }
     )
 
-    state = orchestrator.invoke("fix the login bug")
+    run_id = "test-qa-revision-loop"
+    _approve_plan(run_id)
+    state = orchestrator.invoke("fix the login bug", run_id=run_id)
 
     backend_packets = [a for a in state["artifacts"] if a["kind"] == "backend_work_packet"]
     assert len(backend_packets) == 2
@@ -746,7 +823,9 @@ def test_blocked_build_role_handoff_routes_next_build_role() -> None:
         }
     )
 
-    state = orchestrator.invoke("fix login and then create the page")
+    run_id = "test-blocked-build-role-handoff"
+    _approve_plan(run_id)
+    state = orchestrator.invoke("fix login and then create the page", run_id=run_id)
     artifact_kinds = [artifact["kind"] for artifact in state["artifacts"]]
     backend_packet = next(artifact for artifact in state["artifacts"] if artifact["kind"] == "backend_work_packet")
 

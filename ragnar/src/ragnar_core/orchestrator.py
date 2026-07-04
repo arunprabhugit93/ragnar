@@ -195,6 +195,7 @@ class RagnarOrchestrator:
         graph.add_node("researcher", self.researcher)
         graph.add_node("architect_plan", self.architect_plan)
         graph.add_node("conductor_review_plan", self.conductor_review_plan)
+        graph.add_node("plan_approval_gate", self.plan_approval_gate)
         graph.add_node("dispatch_build_roles", self.dispatch_build_roles)
         graph.add_node("backend_engineer", self.backend_engineer)
         graph.add_node("frontend_engineer", self.frontend_engineer)
@@ -220,20 +221,23 @@ class RagnarOrchestrator:
             {
                 "researcher": "researcher",
                 "architect_plan": "architect_plan",
-                "dispatch_build_roles": "dispatch_build_roles",
+                # "dispatch_build_roles" here means "ready for the build phase" --
+                # routed through plan_approval_gate first, which itself passes
+                # straight through when no plan artifact exists (no architect ran).
+                "dispatch_build_roles": "plan_approval_gate",
             },
         )
         graph.add_conditional_edges(
             "researcher",
             self.after_research,
-            {"architect_plan": "architect_plan", "dispatch_build_roles": "dispatch_build_roles"},
+            {"architect_plan": "architect_plan", "dispatch_build_roles": "plan_approval_gate"},
         )
         graph.add_conditional_edges(
             "architect_plan",
             self.after_architect,
             {
                 "conductor_review_plan": "conductor_review_plan",
-                "dispatch_build_roles": "dispatch_build_roles",
+                "dispatch_build_roles": "plan_approval_gate",
                 "final_report": "final_report",
             },
         )
@@ -242,9 +246,14 @@ class RagnarOrchestrator:
             self.after_plan_review,
             {
                 "architect_plan": "architect_plan",
-                "dispatch_build_roles": "dispatch_build_roles",
+                "dispatch_build_roles": "plan_approval_gate",
                 "final_report": "final_report",
             },
+        )
+        graph.add_conditional_edges(
+            "plan_approval_gate",
+            self.after_plan_approval,
+            {"dispatch_build_roles": "dispatch_build_roles", "final_report": "final_report"},
         )
         graph.add_conditional_edges(
             "dispatch_build_roles",
@@ -494,6 +503,69 @@ class RagnarOrchestrator:
             "proposed_actions": result["proposed_actions"],
             "audit_events": [result["audit_event"]],
         }
+
+    def plan_approval_gate(self, state: RagnarState) -> dict[str, Any]:
+        """Owner checkpoint between plan creation and the build phase.
+
+        Only fires when a delivery plan was actually produced -- fast_path/
+        standard_path objectives with no architect step have nothing to
+        approve here and pass straight through. Reuses the same
+        ApprovalStore/ApprovalBroker pattern as the end-of-run approval_gate,
+        so it resolves the same way: rerun with the same run_id after
+        `/approve <run_id> conductor start_build_phase`.
+        """
+        plan_artifact = self._latest_artifact(state, "architecture_plan")
+        if plan_artifact is None:
+            return {
+                "phase": "plan_approval_not_required",
+                "audit_events": [
+                    _event("plan_approval_gate", "no delivery plan produced; build phase needs no plan approval")
+                ],
+            }
+
+        conductor = self.registry.get("conductor")
+        action = "start_build_phase"
+        decision = self.approval_broker.decide(conductor, action)
+        if decision.decision is Decision.DENY:
+            raise RuntimeError(f"conductor cannot start the build phase: {decision.reason}")
+        if decision.decision is Decision.ALLOW:
+            return {
+                "phase": "plan_approval_not_required",
+                "audit_events": [
+                    _event("plan_approval_gate", "start_build_phase does not require owner approval by policy")
+                ],
+            }
+
+        latest = self.approval_store.latest(state["run_id"], conductor.role_id, action)
+        if latest and latest.status == "approved":
+            return {
+                "phase": "plan_approved",
+                "audit_events": [_event("plan_approval_gate", "owner approved the delivery plan")],
+            }
+        if latest and latest.status == "denied":
+            raise RuntimeError(f"Owner denied the delivery plan: {latest.reason}")
+        if latest is None:
+            latest = self.approval_store.record(state["run_id"], conductor.role_id, action, "pending", decision.reason)
+
+        return {
+            "phase": "awaiting_plan_approval",
+            "blocked": True,
+            "approval_requests": [
+                {
+                    "role_id": conductor.role_id,
+                    "action": action,
+                    "reason": decision.reason,
+                    "requested_at": latest.recorded_at,
+                    "status": "pending_owner_approval",
+                }
+            ],
+            "audit_events": [_event("plan_approval_gate", "paused for owner plan approval")],
+        }
+
+    def after_plan_approval(self, state: RagnarState) -> str:
+        if state.get("phase") == "awaiting_plan_approval":
+            return "final_report"
+        return "dispatch_build_roles"
 
     def dispatch_build_roles(self, state: RagnarState) -> dict[str, Any]:
         selected = state.get("selected_build_roles", [])

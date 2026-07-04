@@ -272,6 +272,78 @@ def _sync_agent_definition_blocks(client: Any, agent_id: str, role: RoleContract
         client.agents.blocks.attach(block_id, agent_id=agent_id)
 
 
+COMMUNICATION_TOOL_NAMES = [
+    "send_message_to_agent_and_wait_for_reply",
+    "send_message_to_agents_matching_tags",
+]
+
+
+def _resolve_tool_id(client: Any, tool_name: str) -> str | None:
+    for lister in (
+        lambda: client.tools.list(name=tool_name),
+        lambda: client.tools.list(),
+    ):
+        try:
+            matches = _page_items_generic(lister())
+        except Exception:
+            continue
+        for tool in matches:
+            if getattr(tool, "name", None) == tool_name:
+                return str(getattr(tool, "id"))
+    return None
+
+
+def _page_items_generic(page: Any) -> list[Any]:
+    if hasattr(page, "data"):
+        return list(page.data)
+    if hasattr(page, "items"):
+        return list(page.items)
+    try:
+        return list(page)
+    except TypeError:
+        return []
+
+
+def _sync_agent_communication_tools(client: Any, agent_id: str, enabled: bool) -> bool:
+    """Attach (or detach) Letta's native agent-to-agent messaging tools on an
+    already-existing durable agent.
+
+    New agents get these tools at create time via the `tools` field in the
+    create payload; that field has no effect on an agent that already exists,
+    so re-running provisioning after flipping `enable_agent_messaging` would
+    otherwise silently do nothing for every already-provisioned role. This
+    makes the toggle actually take effect on existing agents too.
+
+    Best-effort: different letta-client versions expose tool attach/detach
+    slightly differently, so failures here are swallowed rather than aborting
+    the whole provisioning run -- verify with `client.agents.tools.list` (or
+    the Letta UI) after running if you need certainty it took effect.
+    """
+    all_synced = True
+    for tool_name in COMMUNICATION_TOOL_NAMES:
+        try:
+            if enabled:
+                try:
+                    client.agents.tools.attach(tool_name, agent_id=agent_id)
+                    continue
+                except Exception:
+                    tool_id = _resolve_tool_id(client, tool_name)
+                    if tool_id is None:
+                        all_synced = False
+                        continue
+                    client.agents.tools.attach(tool_id, agent_id=agent_id)
+            else:
+                try:
+                    client.agents.tools.detach(tool_name, agent_id=agent_id)
+                except Exception:
+                    tool_id = _resolve_tool_id(client, tool_name)
+                    if tool_id is not None:
+                        client.agents.tools.detach(tool_id, agent_id=agent_id)
+        except Exception:
+            all_synced = False
+    return all_synced
+
+
 def _load_manifest(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"agents": {}}
@@ -339,6 +411,7 @@ def create_or_reuse_agents(
         existing = agents_manifest.get(role.role_id)
         if existing and existing.get("letta_agent_id"):
             _sync_agent_definition_blocks(client, existing["letta_agent_id"], role)
+            tools_synced = _sync_agent_communication_tools(client, existing["letta_agent_id"], communication_tools)
             update_payload = {
                 "model": model_for(role.role_id),
                 "max_tokens": max_tokens_for(role.role_id),
@@ -354,6 +427,8 @@ def create_or_reuse_agents(
             existing["model"] = model_for(role.role_id)
             existing["max_tokens"] = max_tokens_for(role.role_id)
             existing["role_definition_version"] = ROLE_AGENT_DEFINITION_VERSION
+            existing["communication_tools"] = communication_tools
+            existing["communication_tools_synced"] = tools_synced
             agents_manifest[role.role_id] = existing
             _save_manifest(manifest_path, manifest)
             provisioned.append(
@@ -386,10 +461,7 @@ def create_or_reuse_agents(
             },
         }
         if communication_tools:
-            payload["tools"] = [
-                "send_message_to_agent_and_wait_for_reply",
-                "send_message_to_agents_matching_tags",
-            ]
+            payload["tools"] = list(COMMUNICATION_TOOL_NAMES)
 
         create_signature = inspect.signature(client.agents.create)
         supported_payload = {
@@ -407,7 +479,10 @@ def create_or_reuse_agents(
             model=model_for(role.role_id),
             max_tokens=max_tokens_for(role.role_id),
         )
-        agents_manifest[role.role_id] = asdict(record)
+        manifest_entry = asdict(record)
+        manifest_entry["communication_tools"] = communication_tools
+        manifest_entry["communication_tools_synced"] = communication_tools
+        agents_manifest[role.role_id] = manifest_entry
         provisioned.append(record)
         _save_manifest(manifest_path, manifest)
 

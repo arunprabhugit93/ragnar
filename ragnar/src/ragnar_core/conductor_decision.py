@@ -152,7 +152,12 @@ def make_conductor_decision(objective: str, selected_build_roles: list[str], pro
         research_required=profile_name == "research_first",
         architect_required=profile.use_architect,
         review_required=profile.use_conductor_plan_review or profile.use_conductor_qa_review == "always",
-        inter_agent_comm_required=profile.allow_inter_agent_chat and (multi_role or profile_name in {"research_first", "governed_path"}),
+        # Every profile now allows inter-agent chat (all durable role agents can
+        # reach each other); this simply follows the profile flag instead of also
+        # gating on role count, so a single-role run can still consult a peer
+        # (e.g. backend_engineer proactively pinging qa_engineer) rather than
+        # only unlocking it once multiple build roles are active.
+        inter_agent_comm_required=profile.allow_inter_agent_chat,
         confidence=confidence,
         needs_llm_decision=confidence < 0.65,
         reason=reason,
