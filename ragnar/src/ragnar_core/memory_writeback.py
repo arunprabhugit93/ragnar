@@ -14,10 +14,21 @@ from .rag_memory import DEFAULT_DB_URL, DEFAULT_EMBEDDING_MODEL, MemoryRecord, u
 # Near-duplicate consolidation: skip writing a new record whose text is this
 # similar (difflib ratio, stdlib-only -- no embedding call needed at write time)
 # to an existing record already in the same namespace/role/scope. Keeps the
-# ledger from accumulating many near-identical "role X prepared Y" lessons
-# that differ only by run_id or a few words.
+# ledger from accumulating many near-identical restatements.
+#
+# Deliberately scoped to classifications where duplication really is just
+# noise -- NOT "qa_finding" or "decision": for QA findings, repetition is
+# itself the signal (a role failing the same way three times is more
+# actionable than once, and silently dropping the 2nd/3rd occurrence would
+# hide that pattern); decisions are rare and high-value enough that two
+# textually-similar entries are more likely to be two genuinely distinct
+# decisions than noise. "role_lesson" is excluded too, since
+# classify_writeback() already routes the routine "X prepared Y for run Z"
+# boilerplate to run_noise first -- what's left in role_lesson has already
+# been filtered down to non-boilerplate, reflective content.
 _NEAR_DUPLICATE_THRESHOLD = 0.87
 _NEAR_DUPLICATE_WINDOW = 50
+_NEAR_DUPLICATE_ELIGIBLE_CLASSIFICATIONS = {"run_noise", "provider_error", "project_context"}
 
 
 def default_writeback_path(repo_root: Path) -> Path:
@@ -50,7 +61,9 @@ class MemoryWritebackStore:
                     continue
                 key = (str(curated["namespace"]), str(curated["scope"]), str(curated["role_id"]))
                 recent_texts = recent_texts_by_scope.setdefault(key, [])
-                if _is_near_duplicate(curated["text"], recent_texts):
+                if curated["classification"] in _NEAR_DUPLICATE_ELIGIBLE_CLASSIFICATIONS and _is_near_duplicate(
+                    curated["text"], recent_texts
+                ):
                     continue
                 handle.write(json.dumps(curated, sort_keys=True) + "\n")
                 seen.add(curated["fingerprint"])

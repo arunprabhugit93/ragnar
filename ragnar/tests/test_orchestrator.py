@@ -595,6 +595,82 @@ def test_memory_writebacks_are_curated_and_deduped(tmp_path: Path) -> None:
     assert records[1]["promote"] is False
 
 
+def test_near_duplicate_consolidation_skips_noise_but_keeps_qa_findings_and_decisions(tmp_path: Path) -> None:
+    """Near-duplicate suppression must only apply to genuinely redundant
+    restatements (project_context here), never to qa_finding or decision --
+    for QA findings, repetition is itself the signal (a role failing the same
+    way three times matters more than once), and decisions are rare/high-value
+    enough that a textual near-match is more likely a distinct decision than
+    noise. Silently dropping either would be a real quality regression."""
+    store = MemoryWritebackStore(tmp_path / "memory.jsonl")
+
+    qa_finding_1 = MemoryWriteback(
+        role_id="qa_engineer",
+        namespace="qa_findings",
+        scope="shared",
+        text="QA failed on run run-1: patch failed to apply for: backend_engineer",
+        tags=["ragnar", "qa_finding", "role:qa_engineer", "ground_truth"],
+        source_run_id="run-1",
+        source_artifact="qa_verdict",
+    )
+    qa_finding_2 = MemoryWriteback(
+        role_id="qa_engineer",
+        namespace="qa_findings",
+        scope="shared",
+        text="QA failed on run run-2: patch failed to apply for: backend_engineer",
+        tags=["ragnar", "qa_finding", "role:qa_engineer", "ground_truth"],
+        source_run_id="run-2",
+        source_artifact="qa_verdict",
+    )
+    decision_1 = MemoryWriteback(
+        role_id="conductor",
+        namespace="decisions",
+        scope="shared",
+        text="Decision: use OpenRouter for all provider calls to avoid per-vendor keys.",
+        tags=["decision"],
+        source_run_id="run-1",
+        source_artifact="conductor_plan_review",
+    )
+    decision_2 = MemoryWriteback(
+        role_id="conductor",
+        namespace="decisions",
+        scope="shared",
+        text="Decision: use OpenRouter for all provider calls to avoid per-vendor billing.",
+        tags=["decision"],
+        source_run_id="run-2",
+        source_artifact="conductor_plan_review",
+    )
+    project_context_1 = MemoryWriteback(
+        role_id="researcher",
+        namespace="project_context",
+        scope="shared",
+        text="The project uses a microservice architecture with three core services handling billing.",
+        tags=["context"],
+        source_run_id="run-1",
+        source_artifact="research_brief",
+    )
+    project_context_2 = MemoryWriteback(
+        role_id="researcher",
+        namespace="project_context",
+        scope="shared",
+        text="The project uses a microservice architecture with three core services handling billing!",
+        tags=["context"],
+        source_run_id="run-2",
+        source_artifact="research_brief",
+    )
+
+    written = store.append_many(
+        [qa_finding_1, qa_finding_2, decision_1, decision_2, project_context_1, project_context_2]
+    )
+    records = store.list()
+    classifications = [record["classification"] for record in records]
+
+    assert written == 5  # only the near-duplicate project_context entry is skipped
+    assert classifications.count("qa_finding") == 2
+    assert classifications.count("decision") == 2
+    assert classifications.count("project_context") == 1
+
+
 def test_role_context_carries_prior_role_handoff_without_full_repeat() -> None:
     registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
     orchestrator = RagnarOrchestrator(
