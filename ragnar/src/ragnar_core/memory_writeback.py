@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import json
 from pathlib import Path
@@ -8,6 +9,15 @@ from typing import Iterable
 
 from .contracts import MemoryWriteback
 from .rag_memory import DEFAULT_DB_URL, DEFAULT_EMBEDDING_MODEL, MemoryRecord, upsert_records
+
+
+# Near-duplicate consolidation: skip writing a new record whose text is this
+# similar (difflib ratio, stdlib-only -- no embedding call needed at write time)
+# to an existing record already in the same namespace/role/scope. Keeps the
+# ledger from accumulating many near-identical "role X prepared Y" lessons
+# that differ only by run_id or a few words.
+_NEAR_DUPLICATE_THRESHOLD = 0.87
+_NEAR_DUPLICATE_WINDOW = 50
 
 
 def default_writeback_path(repo_root: Path) -> Path:
@@ -26,15 +36,25 @@ class MemoryWritebackStore:
 
     def append_many(self, records: Iterable[MemoryWriteback]) -> int:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        seen = {record.get("fingerprint") for record in self.list()}
+        existing = self.list()
+        seen = {record.get("fingerprint") for record in existing}
+        recent_texts_by_scope: dict[tuple[str, str, str], list[str]] = {}
+        for record in existing:
+            key = (str(record.get("namespace")), str(record.get("scope")), str(record.get("role_id")))
+            recent_texts_by_scope.setdefault(key, []).append(str(record.get("text", "")))
         count = 0
         with self.path.open("a", encoding="utf-8") as handle:
             for record in records:
                 curated = curate_writeback(record)
                 if curated is None or curated["fingerprint"] in seen:
                     continue
+                key = (str(curated["namespace"]), str(curated["scope"]), str(curated["role_id"]))
+                recent_texts = recent_texts_by_scope.setdefault(key, [])
+                if _is_near_duplicate(curated["text"], recent_texts):
+                    continue
                 handle.write(json.dumps(curated, sort_keys=True) + "\n")
                 seen.add(curated["fingerprint"])
+                recent_texts.append(curated["text"])
                 count += 1
         return count
 
@@ -50,9 +70,21 @@ class MemoryWritebackStore:
                 records.append(record)
         return records
 
-    def promote_to_pgvector(self, db_url: str = DEFAULT_DB_URL, embedding_model: str = DEFAULT_EMBEDDING_MODEL) -> int:
+    def promote_to_pgvector(
+        self,
+        db_url: str = DEFAULT_DB_URL,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        run_id: str | None = None,
+    ) -> int:
+        """Upsert curated writebacks into rag_memory's pgvector table.
+
+        Idempotent via upsert_records' fingerprint ON CONFLICT, so passing
+        run_id to scope this to just the run that finished is a cost/latency
+        optimization (skip re-embedding the whole history every time), not a
+        correctness requirement -- omitting it re-promotes everything safely.
+        """
         records = []
-        for item in self.list():
+        for item in self.list(run_id=run_id):
             if item.get("promote") is False:
                 continue
             records.append(
@@ -99,6 +131,13 @@ def classify_writeback(text: str, tags: list[str], namespace: str | None) -> str
     if "decision" in tag_text or "decided" in lowered:
         return "decision"
     return "project_context"
+
+
+def _is_near_duplicate(text: str, recent_texts: list[str]) -> bool:
+    for other in recent_texts[-_NEAR_DUPLICATE_WINDOW:]:
+        if difflib.SequenceMatcher(None, text, other).ratio() >= _NEAR_DUPLICATE_THRESHOLD:
+            return True
+    return False
 
 
 def _fingerprint(namespace: str, scope: str, role_id: str, text: str) -> str:

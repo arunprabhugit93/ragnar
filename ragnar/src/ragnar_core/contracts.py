@@ -538,6 +538,15 @@ def compact_contract_json(contract: RoleInvocationContract) -> str:
         "allowed_path_globs": contract.file_policy.get("allowed_path_globs", []),
         "allowed_command_families": contract.command_policy.get("allowed_command_families", []),
         "project_profile": compact_profile,
+        # These were previously omitted entirely from the compact payload -- not
+        # trimmed, just silently dropped. ContextBroker already bounds both
+        # (max_total_hits/max_hit_chars for memory_context, max_handoffs/
+        # max_handoff_chars for handoff_inputs) before they ever reach here, so
+        # "compact" only needs to still drop the redundant role_contract/full
+        # expected_output_schema below, not the retrieval results a role actually
+        # needs to act on.
+        "memory_context": contract.memory_context,
+        "handoff_inputs": contract.handoff_inputs,
         "rework_feedback": contract.rework_feedback,
         "agent_messaging_allowed": contract.agent_messaging_allowed,
         "output_rules": [

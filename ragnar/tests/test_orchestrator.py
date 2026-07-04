@@ -210,6 +210,69 @@ def test_conductor_decision_profiles_by_complexity() -> None:
     assert planning.selected_build_roles == []
 
 
+def test_max_agent_calls_budget_scales_with_configured_revision_caps() -> None:
+    """conductor_triage must recompute max_agent_calls from the actual
+    configured max_plan_revisions/max_qa_revisions (5 each in ragnar.yaml),
+    not trust execution_profiles.py's static per-profile constants -- those
+    were pure decoration until this budget was enforced and are far too tight
+    once a revision loop is actually allowed to run (each iteration costs 2+
+    real calls, and the cap defaults to 5)."""
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    orchestrator = RagnarOrchestrator(
+        registry,
+        config_path=Path("ragnar/ragnar.yaml"),
+        prepare_worktrees=False,
+        record_runs=False,
+        memory_mode="off",
+    )
+    state: Any = {"run_id": "run-budget-check", "objective": "fix the login bug", "project_profile": {}}
+    result = orchestrator.conductor_triage(state)
+
+    assert result["execution_mode"] == "governed_path"
+    max_agent_calls = result["conductor_decision"]["budgets"]["max_agent_calls"]
+    configured_qa_loop_cost = 2 * (orchestrator.config.max_qa_revisions(default=MAX_QA_REVISIONS) + 1)
+    # The old static governed_path constant (10) could not even cover the QA
+    # revision loop alone at today's configured cap -- confirm the recomputed
+    # budget actually has room for it.
+    assert max_agent_calls >= configured_qa_loop_cost
+    assert max_agent_calls > 10
+
+
+def test_call_role_runtime_blocks_at_budget_without_invoking_the_role() -> None:
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    orchestrator = RagnarOrchestrator(
+        registry,
+        config_path=Path("ragnar/ragnar.yaml"),
+        prepare_worktrees=False,
+        record_runs=False,
+    )
+    scripted = _ScriptedRoleRuntime(
+        {("backend_engineer", "edit_backend_worktree"): ['{"status":"completed","summary":"ok","proposed_patches":[],"handoffs":[],"memory_writebacks":[],"proposed_actions":[]}']}
+    )
+    orchestrator.role_runtime = scripted
+    role = registry.get("backend_engineer")
+    state: Any = {
+        "run_id": "run-test",
+        "agent_call_count": 2,
+        "conductor_decision": {"budgets": {"max_agent_calls": 2}},
+        "execution_mode": "fast_path",
+    }
+
+    result, new_count = orchestrator._call_role_runtime(role, "objective", "edit_backend_worktree", [], state, invocation=None)
+
+    assert result.status == "budget_exhausted"
+    assert result.raw_reply is None
+    assert new_count == 2
+    assert scripted.invocations == []
+
+    # One call under budget must still go through normally.
+    state["agent_call_count"] = 1
+    result2, new_count2 = orchestrator._call_role_runtime(role, "objective", "edit_backend_worktree", [], state, invocation=None)
+    assert result2.status != "budget_exhausted"
+    assert new_count2 == 2
+    assert len(scripted.invocations) == 1
+
+
 def test_trivial_fast_path_stops_on_role_failure() -> None:
     registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
     orchestrator = RagnarOrchestrator(
@@ -842,6 +905,57 @@ def test_plan_revision_loop_respects_retry_cap() -> None:
     assert state.get("final_report")
 
 
+def test_conductor_review_reuses_cached_verdict_when_subject_unchanged(tmp_path: Path) -> None:
+    """Simulates the plan-approval-gate replay pattern: conductor_review_plan
+    called twice for the SAME unchanged plan artifact (as happens when a run
+    blocks for owner approval and gets rerun) must not re-bill a second
+    identical LLM call -- and a genuinely changed subject must still trigger
+    a fresh one."""
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    orchestrator = RagnarOrchestrator(
+        registry,
+        config_path=Path("ragnar/ragnar.yaml"),
+        prepare_worktrees=False,
+        record_runs=True,
+    )
+    orchestrator.run_ledger = RunLedgerStore(tmp_path / "run_ledger.jsonl")
+    scripted = _ScriptedRoleRuntime(
+        {("conductor", "review_delivery_plan"): ['{"verdict":"approve","feedback":"looks fine","rework_roles":[]}']}
+    )
+    orchestrator.role_runtime = scripted
+
+    plan_artifact = {
+        "kind": "architecture_plan",
+        "owner_role": "delivery_architect",
+        "created_at": "now",
+        "body": {"agent_result": {"summary": "Do X then Y."}, "diff": {"changed_files": []}},
+    }
+    state: Any = {
+        "run_id": "run-dedup-test",
+        "objective": "fix the login bug",
+        "artifacts": [plan_artifact],
+        "plan_revision_count": 0,
+    }
+
+    result1 = orchestrator.conductor_review_plan(state)
+    assert result1["artifacts"][0]["body"].get("reused_from_ledger") is not True
+    assert len(scripted.invocations) == 1
+
+    result2 = orchestrator.conductor_review_plan(state)
+    assert result2["artifacts"][0]["body"].get("reused_from_ledger") is True
+    assert len(scripted.invocations) == 1
+    assert result2["plan_review_verdict"] == "approve"
+
+    changed_plan_artifact = {
+        **plan_artifact,
+        "body": {"agent_result": {"summary": "Do X then Y then Z."}, "diff": {"changed_files": ["a.py"]}},
+    }
+    state["artifacts"] = [changed_plan_artifact]
+    result3 = orchestrator.conductor_review_plan(state)
+    assert result3["artifacts"][0]["body"].get("reused_from_ledger") is not True
+    assert len(scripted.invocations) == 2
+
+
 def test_qa_revision_loop_routes_back_to_named_role() -> None:
     registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
     orchestrator = RagnarOrchestrator(
@@ -1087,6 +1201,36 @@ def test_call_agent_uses_compact_contract_when_requested() -> None:
     assert '"allowed_path_globs"' in prompt_content
     assert '"role_contract"' not in prompt_content
     assert '"expected_output_schema"' not in prompt_content
+    # compact must still carry retrieval results the role needs to act on --
+    # only the redundant role_contract/full schema get dropped, not these.
+    assert '"memory_context"' in prompt_content
+    assert '"handoff_inputs"' in prompt_content
+
+
+def test_compact_contract_carries_actual_memory_and_handoff_content() -> None:
+    fake_client = _FakeLettaClient(_FakeResponse([_FakeAssistantMessage('{"status":"completed","summary":"ok","proposed_patches":[],"handoffs":[],"memory_writebacks":[],"proposed_actions":[]}')]))
+    runtime = RoleRuntime(Path("ragnar/.ragnar/letta_agents.json"), mode="letta")
+    runtime._client = fake_client
+
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    role = registry.get("frontend_engineer")
+    invocation = build_invocation_contract(
+        run_id="run-test",
+        objective="test objective",
+        action="edit_frontend_worktree",
+        role=role,
+        model=ModelConfig(provider="openrouter", model="openrouter/x/y", temperature=0.1, max_tokens=100),
+        workspace={"available": False},
+        policy=None,
+        memory_context=[{"scope": "private", "namespace": role.private_memory_namespace, "query": {}, "hits": [{"text": "PGVECTOR_MARKER_TEXT"}], "errors": []}],
+        handoff_inputs=[{"from_role": "backend_engineer", "summary": "HANDOFF_MARKER_TEXT", "changed_files": [], "patch_count": 0}],
+        compact=True,
+    )
+    runtime._call_agent("agent-under-test", invocation)
+
+    prompt_content = fake_client.agents.messages.calls[0]["messages"][0]["content"]
+    assert "PGVECTOR_MARKER_TEXT" in prompt_content
+    assert "HANDOFF_MARKER_TEXT" in prompt_content
 
 
 def test_agent_transcript_store_appends_and_filters_by_run_id(tmp_path: Path) -> None:
@@ -1416,7 +1560,11 @@ def test_qa_gate_does_not_run_commands_from_profile_when_discovery_disabled() ->
     qa_artifact = result["artifacts"][0]
     assert qa_artifact["body"]["verdict"] == "pass_with_warnings"
     assert qa_artifact["body"]["agent_invocation"]["workspace"]["status"] == "reviewing_build_worktrees"
-    assert qa_artifact["body"]["agent_invocation"]["workspace"]["reviewed_worktrees"][0]["role_id"] == "backend_engineer"
+    # reviewed_worktrees lives only in the observed_facts memory_context entry now,
+    # not duplicated into workspace too -- see qa_gate's comment on why.
+    observed_facts = qa_artifact["body"]["agent_invocation"]["memory_context"][-1]["hits"][0]
+    assert observed_facts["reviewed_worktrees"][0]["role_id"] == "backend_engineer"
+    assert "reviewed_worktrees" not in qa_artifact["body"]["agent_invocation"]["workspace"]
 
 
 def test_qa_gate_discovers_and_runs_command_from_project_profile() -> None:

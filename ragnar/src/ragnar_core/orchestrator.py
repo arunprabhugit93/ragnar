@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import operator
 import os
@@ -21,6 +22,7 @@ from .contracts import (
     agent_result_from_reply,
     build_invocation_contract,
     expected_review_output_schema,
+    MemoryWriteback,
     provider_error_result,
     provider_free_result,
     review_result_from_reply,
@@ -36,9 +38,9 @@ from .memory_writeback import MemoryWritebackStore, default_writeback_path
 from .observability import RunRecorder, default_runs_path
 from .pr_adapter import PullRequestDraftStore, build_pr_draft, default_pr_draft_dir
 from .project_profiler import build_project_profile, qa_commands_from_profile
-from .role_runtime import RoleRuntime, RoleRuntimeMode, default_manifest_path, extract_json_object
+from .role_runtime import RoleRuntime, RoleRuntimeMode, RoleRuntimeResult, default_manifest_path, extract_json_object
 from .role_registry import RoleContract, RoleRegistry, load_role_registry
-from .run_ledger import RunLedgerStore, default_run_ledger_path, record_from_artifact
+from .run_ledger import RunLedgerRecord, RunLedgerStore, default_run_ledger_path, record_from_artifact
 from .workspace import RoleWorkspaceManager
 
 
@@ -79,6 +81,7 @@ class RagnarState(TypedDict, total=False):
     conductor_decision: dict[str, Any]
     intent_analysis: dict[str, Any]
     clarification_question: str
+    agent_call_count: int
 
 
 def _repo_root() -> Path:
@@ -329,6 +332,7 @@ class RagnarOrchestrator:
             state = app.invoke(initial_state, config=config)
             if self.record_runs:
                 state["observability"] = self.recorder.write(state)
+                state["memory_promotion"] = self._auto_promote_memory(state)
             return state
 
         os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
@@ -344,7 +348,19 @@ class RagnarOrchestrator:
             state = app.invoke(initial_state, config=config)
             if self.record_runs:
                 state["observability"] = self.recorder.write(state)
+                state["memory_promotion"] = self._auto_promote_memory(state)
             return state
+
+    def _auto_promote_memory(self, state: RagnarState) -> dict[str, Any]:
+        """Best-effort: a missing/misconfigured pgvector DB must not crash a run
+        that otherwise completed -- promotion improves future runs' retrieval,
+        it isn't a correctness requirement for the run that just finished.
+        """
+        try:
+            promoted = self.memory_writebacks.promote_to_pgvector(run_id=str(state["run_id"]))
+            return {"promoted": promoted}
+        except Exception as exc:
+            return {"error": str(exc)}
 
     def intake_objective(self, state: RagnarState) -> dict[str, Any]:
         objective = state["objective"].strip()
@@ -422,6 +438,14 @@ class RagnarOrchestrator:
                 },
             )
         execution_mode = decision.execution_profile
+        profile = profile_by_name(execution_mode)
+        decision = replace(
+            decision,
+            budgets={
+                **decision.budgets,
+                "max_agent_calls": self._max_agent_calls_budget(profile, selected_roles),
+            },
+        )
         context_queries, memory_context = self.context_broker.retrieve_for_roles(objective, selected_roles)
         return {
             "phase": "triaged",
@@ -501,6 +525,7 @@ class RagnarOrchestrator:
             "plan_revision_count": result["revision_count"],
             "artifacts": [result["artifact"]],
             "proposed_actions": result["proposed_actions"],
+            "agent_call_count": result["agent_call_count"],
             "audit_events": [result["audit_event"]],
         }
 
@@ -647,6 +672,73 @@ class RagnarOrchestrator:
             rework_feedback=self._rework_feedback_for(state, "workflow_engineer"),
         )
 
+    def _deterministic_qa_writebacks(
+        self,
+        run_id: str,
+        qa: RoleContract,
+        verdict: str,
+        failed_packet_facts: list[dict[str, Any]],
+        command_results: list[dict[str, Any]],
+        denied_commands: list[dict[str, Any]],
+    ) -> list[MemoryWriteback]:
+        """Durable QA findings captured from ground truth, independent of
+        whether the QA agent's own reply chose to write a memory_writeback
+        about them. A repeated pattern (e.g. a role's patches keep failing to
+        apply) should be discoverable in future runs even if no model ever
+        reflects on it.
+        """
+        if verdict != "fail":
+            return []
+        patch_failed_roles = sorted(
+            {str(fact["owner_role"]) for fact in failed_packet_facts if fact.get("patch_apply_failed")}
+        )
+        failed_commands = [
+            f"{' '.join(result['command'])} (exit {result['exit_code']})"
+            for result in command_results
+            if result.get("exit_code") != 0
+        ]
+        reasons = []
+        if patch_failed_roles:
+            reasons.append(f"patch failed to apply for: {', '.join(patch_failed_roles)}")
+        if failed_commands:
+            reasons.append(f"failing commands: {'; '.join(failed_commands)}")
+        if denied_commands:
+            reasons.append(f"{len(denied_commands)} command(s) denied by workspace policy")
+        if not reasons:
+            return []
+
+        writebacks = [
+            MemoryWriteback(
+                role_id=qa.role_id,
+                namespace="qa_findings",
+                scope="shared",
+                text=f"QA failed on run {run_id}: {'; '.join(reasons)}",
+                tags=["ragnar", "qa_finding", "role:qa_engineer", "ground_truth"],
+                source_run_id=run_id,
+                source_artifact="qa_verdict",
+            )
+        ]
+        for role_id in patch_failed_roles:
+            if role_id not in BUILD_ROLE_SET:
+                continue
+            role = self.registry.get(role_id)
+            writebacks.append(
+                MemoryWriteback(
+                    role_id=role_id,
+                    namespace=role.private_memory_namespace,
+                    scope="private",
+                    text=(
+                        f"A patch this role proposed in run {run_id} failed to apply "
+                        "(git apply check failed). Re-verify diff context against the "
+                        "actual current file content before proposing patches."
+                    ),
+                    tags=["ragnar", "qa_finding", "patch_apply_failed", f"role:{role_id}"],
+                    source_run_id=run_id,
+                    source_artifact="qa_verdict",
+                )
+            )
+        return writebacks
+
     def qa_gate(self, state: RagnarState) -> dict[str, Any]:
         qa = self.registry.get("qa_engineer")
         decision = self.approval_broker.decide(qa, "produce_qa_verdict")
@@ -668,7 +760,9 @@ class RagnarOrchestrator:
             "worktree_path": None,
             "status": "reviewing_build_worktrees" if reviewed_diffs else "no_build_worktrees",
             "message": "QA reviews selected build role worktrees; it does not need its own build worktree.",
-            "reviewed_worktrees": reviewed_diffs,
+            # reviewed_worktrees deliberately lives only in observed_facts below, not
+            # here -- both used to carry the same diff data into the same invocation
+            # contract, doubling that payload's tokens for no reason.
         }
         qa_commands = state.get("qa_commands", [])
         commands_from_profile = False
@@ -757,21 +851,27 @@ class RagnarOrchestrator:
             compact=bool(self.config.compact_letta_invocations()),
             agent_messaging_allowed=bool(state.get("conductor_decision", {}).get("inter_agent_comm_required")),
         )
+        agent_call_count = state.get("agent_call_count", 0)
         if runtime_result == "pending":
-            runtime_result = self.role_runtime.run(
-                qa, state["objective"], "produce_qa_verdict", role_context, invocation=invocation
+            runtime_result, agent_call_count = self._call_role_runtime(
+                qa, state["objective"], "produce_qa_verdict", role_context, state, invocation=invocation
             )
             if runtime_result.raw_reply is not None:
                 agent_result = agent_result_from_reply(state["run_id"], qa, "qa_verdict", runtime_result.raw_reply)
             elif runtime_result.status == "provider_error":
                 agent_result = provider_error_result(state["run_id"], qa, "qa_verdict", runtime_result.message)
+            elif runtime_result.status == "budget_exhausted":
+                agent_result = provider_free_result(state["run_id"], qa, "qa_verdict", runtime_result.message)
             else:
                 agent_result = provider_free_result(
                     state["run_id"], qa, "qa_verdict", f"Provider-free QA reasoning; deterministic verdict is {verdict}."
                 )
 
         if self.record_runs:
-            self.memory_writebacks.append_many(agent_result.memory_writebacks)
+            deterministic_writebacks = self._deterministic_qa_writebacks(
+                state["run_id"], qa, verdict, failed_packet_facts, command_results, denied_commands
+            )
+            self.memory_writebacks.append_many(list(agent_result.memory_writebacks) + deterministic_writebacks)
         if self.record_runs and runtime_result is not None and runtime_result.transcript is not None:
             self.agent_transcripts.append(state["run_id"], qa.role_id, "produce_qa_verdict", runtime_result.transcript)
 
@@ -808,6 +908,7 @@ class RagnarOrchestrator:
                 )
             ],
             "proposed_actions": proposed_actions,
+            "agent_call_count": agent_call_count,
             "audit_events": [_event("qa_gate", "produced QA verdict", verdict=verdict)],
         }
 
@@ -851,6 +952,7 @@ class RagnarOrchestrator:
             "qa_revision_count": result["revision_count"],
             "artifacts": [result["artifact"]],
             "proposed_actions": result["proposed_actions"],
+            "agent_call_count": result["agent_call_count"],
             "audit_events": [result["audit_event"]],
         }
 
@@ -950,22 +1052,25 @@ class RagnarOrchestrator:
             "blocked": bool(state.get("blocked")),
             "approval_requests": requests,
         }
+        briefing, agent_call_count = self._conductor_synthesize_briefing(state, report)
         return {
             "final_report": json.dumps(report, indent=2),
-            "owner_briefing": self._conductor_synthesize_briefing(state, report),
+            "owner_briefing": briefing,
+            "agent_call_count": agent_call_count,
             "audit_events": [_event("final_report", "created final orchestration report")],
         }
 
-    def _conductor_synthesize_briefing(self, state: RagnarState, report: dict[str, Any]) -> str:
+    def _conductor_synthesize_briefing(self, state: RagnarState, report: dict[str, Any]) -> tuple[str, int]:
+        agent_call_count = state.get("agent_call_count", 0)
         if state.get("phase") == "needs_clarification":
-            return str(state.get("clarification_question") or "Ragnar needs clarification before continuing.")
+            return str(state.get("clarification_question") or "Ragnar needs clarification before continuing."), agent_call_count
         if state.get("execution_mode") in {"fast_path", "standard_path"}:
             status_line = "Awaiting your approval." if report["blocked"] else "No approvals pending."
             roles_line = ", ".join(report["selected_build_roles"]) or "no build roles"
             return (
                 f"Run {report['run_id']}: {report['phase']}. {state.get('execution_mode')} completed across "
                 f"{roles_line} with {report['artifact_count']} artifacts. {status_line}"
-            )
+            ), agent_call_count
         conductor = self.registry.get("conductor")
         decision = self.approval_broker.decide(conductor, "summarize_status")
         if decision.decision is Decision.DENY:
@@ -1016,8 +1121,8 @@ class RagnarOrchestrator:
             project_profile=state.get("project_profile"),
             agent_messaging_allowed=bool(state.get("conductor_decision", {}).get("inter_agent_comm_required")),
         )
-        runtime_result = self.role_runtime.run(
-            conductor, state["objective"], "summarize_status", memory_context, invocation=invocation
+        runtime_result, agent_call_count = self._call_role_runtime(
+            conductor, state["objective"], "summarize_status", memory_context, state, invocation=invocation
         )
         if self.record_runs and runtime_result.transcript is not None:
             self.agent_transcripts.append(state["run_id"], conductor.role_id, "summarize_status", runtime_result.transcript)
@@ -1026,7 +1131,7 @@ class RagnarOrchestrator:
                 payload = json.loads(extract_json_object(runtime_result.raw_reply))
                 briefing = str(payload.get("briefing", "")).strip()
                 if briefing:
-                    return briefing
+                    return briefing, agent_call_count
             except (json.JSONDecodeError, ValueError, AttributeError):
                 pass
 
@@ -1035,7 +1140,7 @@ class RagnarOrchestrator:
         return (
             f"Run {report['run_id']}: {report['phase']}. "
             f"{report['artifact_count']} artifacts produced across {roles_line}. {status_line}"
-        )
+        ), agent_call_count
 
     def after_intent_analysis(self, state: RagnarState) -> str:
         if state.get("intent_analysis", {}).get("needs_clarification"):
@@ -1117,6 +1222,33 @@ class RagnarOrchestrator:
         if len(rework_roles) == 1 and rework_roles[0] in BUILD_SEQUENCE:
             return rework_roles[0]
         return "dispatch_build_roles"
+
+    def _max_agent_calls_budget(self, profile: Any, selected_roles: list[str]) -> int:
+        """Recompute the enforced call ceiling from the ACTUAL configured revision
+        caps (ragnar.yaml's max_plan_revisions/max_qa_revisions), not a static
+        per-profile guess.
+
+        execution_profiles.py's own max_agent_calls constants were pure
+        decoration until this budget was actually enforced -- they don't scale
+        with max_plan_revisions/max_qa_revisions and would silently truncate a
+        legitimately-configured revision loop before it ever reaches its own
+        cap (each loop iteration costs 2+ real calls, and the cap defaults to
+        5 each). This derives a ceiling generous enough to let the configured
+        loops fully play out, still bounding truly pathological runs.
+        """
+        calls = len(selected_roles) + 2  # initial build pass + final briefing, with slack
+        if profile.use_architect:
+            plan_loop_iterations = self.config.max_plan_revisions(default=MAX_PLAN_REVISIONS) + 1
+            calls += 2 * plan_loop_iterations if profile.use_conductor_plan_review else 1
+        if profile.use_qa_agent:
+            calls += 1
+        # Always -- not just when profile.use_conductor_qa_review != "never" --
+        # because a patch that fails to apply forces conductor_review_qa to run
+        # regardless of profile (see after_qa_gate's patch_apply_failed override),
+        # even on fast_path where this loop otherwise never fires.
+        qa_loop_iterations = self.config.max_qa_revisions(default=MAX_QA_REVISIONS) + 1
+        calls += 2 * qa_loop_iterations
+        return calls
 
     def _select_build_roles(self, objective: str) -> list[str]:
         normalized = objective.lower().replace("-", "_").replace("/", " ")
@@ -1300,11 +1432,15 @@ class RagnarOrchestrator:
             compact=bool(self.config.compact_letta_invocations()),
             agent_messaging_allowed=bool(state.get("conductor_decision", {}).get("inter_agent_comm_required")),
         )
-        runtime_result = self.role_runtime.run(role, state["objective"], action, role_context, invocation=invocation)
+        runtime_result, agent_call_count = self._call_role_runtime(
+            role, state["objective"], action, role_context, state, invocation=invocation
+        )
         if runtime_result.raw_reply is not None:
             agent_result = agent_result_from_reply(state["run_id"], role, output_kind, runtime_result.raw_reply)
         elif runtime_result.status == "provider_error":
             agent_result = provider_error_result(state["run_id"], role, output_kind, runtime_result.message)
+        elif runtime_result.status == "budget_exhausted":
+            agent_result = provider_free_result(state["run_id"], role, output_kind, runtime_result.message)
         else:
             agent_result = provider_free_result(
                 state["run_id"],
@@ -1405,6 +1541,7 @@ class RagnarOrchestrator:
             "selected_build_roles": next_selected_roles,
             "artifacts": [artifact],
             "proposed_actions": proposed_actions,
+            "agent_call_count": agent_call_count,
             "audit_events": [
                 _event(
                     role_id,
@@ -1417,6 +1554,46 @@ class RagnarOrchestrator:
 
     def _role_memory_context(self, state: RagnarState, role: RoleContract) -> list[dict[str, Any]]:
         return self.context_broker.role_context(state, role)
+
+    def _call_role_runtime(
+        self,
+        role: RoleContract,
+        objective: str,
+        action: str,
+        context_hits: list[dict[str, Any]],
+        state: RagnarState,
+        invocation: Any = None,
+    ) -> tuple[RoleRuntimeResult, int]:
+        """Enforces conductor_decision's computed max_agent_calls as a real ceiling.
+
+        Only meaningful within a single graph traversal -- a replay after an
+        approval gate starts a fresh count, since neither LangGraph state nor
+        the orchestrator instance survives across separate invoke() calls
+        today. Still closes a real gap: nothing previously stopped a bad
+        revision loop from making far more LLM calls than its execution
+        profile's budget intended.
+        """
+        count = state.get("agent_call_count", 0)
+        max_calls = (state.get("conductor_decision") or {}).get("budgets", {}).get("max_agent_calls")
+        if max_calls and count >= max_calls:
+            used_context_hits = sum(len(item.get("hits", [])) for item in context_hits)
+            return (
+                RoleRuntimeResult(
+                    role_id=role.role_id,
+                    runtime="budget_exhausted",
+                    letta_agent_id=None,
+                    memory_namespace=role.private_memory_namespace,
+                    message=(
+                        f"Skipped: run already used {count} agent calls, at or above the "
+                        f"{max_calls}-call budget for {state.get('execution_mode')}."
+                    ),
+                    used_context_hits=used_context_hits,
+                    status="budget_exhausted",
+                ),
+                count,
+            )
+        result = self.role_runtime.run(role, objective, action, context_hits, invocation=invocation)
+        return result, count + 1
 
     def _latest_artifact(self, state: RagnarState, kind: str) -> dict[str, Any] | None:
         return next((artifact for artifact in reversed(state.get("artifacts", [])) if artifact["kind"] == kind), None)
@@ -1447,6 +1624,18 @@ class RagnarOrchestrator:
         if decision.decision is Decision.DENY:
             raise RuntimeError(f"conductor cannot run {action}: {decision.reason}")
 
+        # Every "rerun after approval" replays the WHOLE graph from START (no true
+        # LangGraph interrupt/resume) -- build roles already skip redundant work via
+        # already_done(), but conductor_review_plan/qa had no equivalent, so approving
+        # a plan and rerunning always re-billed a conductor LLM call reviewing a plan
+        # that hadn't changed since the last pass. Reuse the cached verdict when the
+        # subject is provably unchanged since the last review of this exact action.
+        signature = self._subject_signature(subject_artifact)
+        if not force_revise_roles and signature is not None:
+            cached = self.run_ledger.latest_for(str(state["run_id"]), conductor.role_id, action)
+            if cached and cached.get("artifact_ref") == f"{review_kind}:{signature}":
+                return self._reused_conductor_review(review_kind, state, subject_artifact, cached)
+
         policy = self.workspaces.policies.get("conductor")
         workspace_report = self.workspaces.prepare(state["run_id"], "conductor")
         memory_context = [
@@ -1471,8 +1660,8 @@ class RagnarOrchestrator:
             project_profile=state.get("project_profile"),
             agent_messaging_allowed=bool(state.get("conductor_decision", {}).get("inter_agent_comm_required")),
         )
-        runtime_result = self.role_runtime.run(
-            conductor, state["objective"], action, memory_context, invocation=invocation
+        runtime_result, agent_call_count = self._call_role_runtime(
+            conductor, state["objective"], action, memory_context, state, invocation=invocation
         )
         if runtime_result.raw_reply is not None:
             review = review_result_from_reply(state["run_id"], conductor, runtime_result.raw_reply)
@@ -1538,6 +1727,11 @@ class RagnarOrchestrator:
         )
         audit_event = _event(f"conductor_{review_kind}", "conductor reviewed artifact", verdict=verdict)
 
+        if self.record_runs and signature is not None:
+            self._cache_conductor_review(
+                state, conductor, action, review_kind, signature, verdict, review.feedback, review.rework_roles, revision_count
+            )
+
         return {
             "verdict": verdict,
             "feedback": review.feedback,
@@ -1546,7 +1740,131 @@ class RagnarOrchestrator:
             "artifact": artifact,
             "audit_event": audit_event,
             "proposed_actions": proposed_actions,
+            "agent_call_count": agent_call_count,
         }
+
+    def _subject_signature(self, artifact: dict[str, Any] | None) -> str | None:
+        """Stable content fingerprint for the conductor-review dedup cache.
+
+        Deliberately excludes volatile fields (embedded created_at timestamps
+        on nested HandoffArtifact/MemoryWriteback dataclasses) so a replay
+        that re-derives identical underlying work -- e.g. a build role's
+        already_done skip-artifact standing in for the original real one --
+        produces the same signature the original artifact did.
+        """
+        if not artifact:
+            return None
+        body = artifact.get("body", {})
+        if artifact.get("kind") == "qa_verdict":
+            payload = {
+                "verdict": body.get("verdict"),
+                "failed_packets": body.get("failed_packets"),
+                "commands": [
+                    {"command": c.get("command"), "exit_code": c.get("exit_code")} for c in body.get("commands", [])
+                ],
+                "denied_commands": body.get("denied_commands"),
+            }
+        else:
+            already_done = body.get("already_done")
+            if already_done:
+                payload = {"summary": already_done.get("summary"), "changed_files": already_done.get("changed_files", [])}
+            else:
+                result = body.get("agent_result", {}) or {}
+                diff = body.get("diff") or {}
+                payload = {"summary": result.get("summary"), "changed_files": diff.get("changed_files", [])}
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+    def _reused_conductor_review(
+        self,
+        review_kind: str,
+        state: RagnarState,
+        subject_artifact: dict[str, Any] | None,
+        cached: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = json.loads(cached.get("summary") or "{}")
+        verdict = str(payload.get("verdict", "approve"))
+        feedback = str(payload.get("feedback", ""))
+        rework_roles = list(payload.get("rework_roles", []))
+        revision_count = int(payload.get("revision_count", 0))
+        artifact = _artifact(
+            f"conductor_{review_kind}",
+            "conductor",
+            {
+                "objective": state["objective"],
+                "reviewed_artifact_kind": subject_artifact["kind"] if subject_artifact else None,
+                "verdict": verdict,
+                "model_verdict": verdict,
+                "feedback": feedback,
+                "rework_roles": rework_roles,
+                "revision_count": revision_count,
+                "reused_from_ledger": True,
+                "note": (
+                    "Subject artifact unchanged since the last review of this action in "
+                    "this run; reused the cached verdict instead of re-billing an "
+                    "identical conductor LLM call."
+                ),
+            },
+        )
+        audit_event = _event(
+            f"conductor_{review_kind}", "reused cached conductor review; subject unchanged", verdict=verdict
+        )
+        proposed_actions: list[dict[str, Any]] = []
+        if verdict == "escalated_to_owner":
+            proposed_actions.append(
+                {
+                    "role_id": "conductor",
+                    "action": "request_approval",
+                    "reason": f"{review_kind} revision cap reached; proceeding under owner review flag.",
+                }
+            )
+        return {
+            "verdict": verdict,
+            "feedback": feedback,
+            "rework_roles": rework_roles,
+            "revision_count": revision_count,
+            "artifact": artifact,
+            "audit_event": audit_event,
+            "proposed_actions": proposed_actions,
+            "agent_call_count": state.get("agent_call_count", 0),
+        }
+
+    def _cache_conductor_review(
+        self,
+        state: RagnarState,
+        conductor: RoleContract,
+        action: str,
+        review_kind: str,
+        signature: str,
+        verdict: str,
+        feedback: str,
+        rework_roles: list[str],
+        revision_count: int,
+    ) -> None:
+        run_id = str(state["run_id"])
+        payload = json.dumps(
+            {"verdict": verdict, "feedback": feedback, "rework_roles": rework_roles, "revision_count": revision_count},
+            sort_keys=True,
+        )
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {"run_id": run_id, "role_id": conductor.role_id, "action": action, "signature": signature, "revision_count": revision_count},
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        self.run_ledger.append(
+            RunLedgerRecord(
+                run_id=run_id,
+                role_id=conductor.role_id,
+                action=action,
+                status=verdict,
+                artifact_kind=f"conductor_{review_kind}",
+                artifact_ref=f"{review_kind}:{signature}",
+                summary=payload,
+                changed_files=[],
+                handoff_to=list(rework_roles),
+                fingerprint=fingerprint,
+            )
+        )
 
 
 def run_objective(

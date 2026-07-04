@@ -145,4 +145,16 @@ class ContextBroker:
         for record in records:
             if record.get("role_id") == role.role_id or record.get("role_id") in receives_from:
                 relevant.append(record)
-        return relevant[-self.budget.max_handoffs :]
+        # Bounded by count already (max_handoffs); also bound text length the same
+        # way _bound_lookups does for memory-provider hits -- a run_ledger summary
+        # can be up to 1000 chars (record_from_artifact's own cap) and was riding
+        # along uncapped here. Fingerprint is a 64-char hash with no value to a
+        # role's reasoning, so it's dropped rather than trimmed.
+        return [
+            {
+                key: (str(value)[: self.budget.max_hit_chars] if key == "summary" else value)
+                for key, value in record.items()
+                if key != "fingerprint"
+            }
+            for record in relevant[-self.budget.max_handoffs :]
+        ]

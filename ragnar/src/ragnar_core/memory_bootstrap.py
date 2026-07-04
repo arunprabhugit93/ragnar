@@ -11,6 +11,20 @@ from .letta_provisioner import _client
 from .role_registry import RoleContract, load_role_registry
 
 
+# DEPRECATED / LEGACY: this seeds a SECOND, separate vector memory store --
+# Letta's own native archival passages/archives, searched by the agent itself
+# via its own tools, using whatever embedding model ragnar.yaml's `embedding:`
+# names. It is invisible to and unbounded by Ragnar's own retrieval pipeline
+# (ContextMemoryProvider / ContextBroker in context_memory.py / context_broker.py),
+# which is the one actually feeding role_context/memory_context into every
+# invocation contract, backed by rag_memory.py's own pgvector table with its
+# own embedding model. The two never sync.
+#
+# rag_memory.py is the single source of truth for role/shared-namespace
+# knowledge retrieval in this system. Prefer `python -m ragnar_core.rag_memory
+# bootstrap` for seeding role knowledge; only run this module if you
+# specifically want Letta's native archival search as an additional,
+# Ragnar-invisible layer the agent can consult on its own.
 BOOTSTRAP_VERSION = "vector-memory-bootstrap/v1"
 DEFAULT_EMBEDDING = "letta/letta-free"
 
@@ -243,6 +257,14 @@ def main() -> None:
     parser.add_argument("--embedding", default=os.environ.get("RAGNAR_LETTA_EMBEDDING", DEFAULT_EMBEDDING))
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+
+    print(
+        "warning: memory_bootstrap seeds Letta's own native archival memory, which "
+        "Ragnar's retrieval pipeline (ContextMemoryProvider) never reads and never "
+        "bounds. rag_memory.py's pgvector table is the source of truth for role "
+        "knowledge retrieval -- run `python -m ragnar_core.rag_memory bootstrap` "
+        "instead unless you specifically want this as an additional layer.\n"
+    )
 
     results = bootstrap_memory(
         roles_path=args.roles,
