@@ -568,6 +568,52 @@ def test_context_broker_compacts_handoff_inputs(tmp_path: Path) -> None:
     ]
 
 
+def test_already_done_skips_past_skip_artifacts_to_the_real_original(tmp_path: Path) -> None:
+    """On a real multi-replay run, a role's first replay produces a skip-
+    artifact whose own agent_result carries a generic "Skipped duplicate
+    work..." placeholder summary, not the real content. A second replay's
+    already_done() lookup must not match THAT skip-artifact as if it were the
+    genuine prior completion -- doing so would return the placeholder text
+    instead of the real summary/changed_files, and each further replay would
+    degrade it again. This was caught via a real end-to-end run, not a mock."""
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    broker = ContextBroker(
+        registry,
+        _FakeMemoryProvider(),  # type: ignore[arg-type]
+        RunLedgerStore(tmp_path / "ledger.jsonl"),
+    )
+    real_artifact = {
+        "kind": "architecture_plan",
+        "owner_role": "delivery_architect",
+        "body": {
+            "allowed_action": "create_delivery_plan",
+            "agent_result": {"status": "completed", "summary": "Real delivery plan content."},
+            "diff": {"changed_files": []},
+        },
+    }
+    skip_artifact = {
+        "kind": "architecture_plan",
+        "owner_role": "delivery_architect",
+        "body": {
+            "allowed_action": "create_delivery_plan",
+            "agent_result": {
+                "status": "completed",
+                "summary": "Skipped duplicate work; prior artifact already exists: architecture_plan.",
+            },
+            "already_done": {"artifact_kind": "architecture_plan", "summary": "Real delivery plan content.", "changed_files": []},
+        },
+    }
+    state: Any = {
+        "run_id": "run-already-done-test",
+        "artifacts": [real_artifact, skip_artifact],
+    }
+
+    existing = broker.already_done(state, "delivery_architect", "create_delivery_plan")
+
+    assert existing is not None
+    assert existing["summary"] == "Real delivery plan content."
+
+
 def test_memory_writebacks_are_curated_and_deduped(tmp_path: Path) -> None:
     store = MemoryWritebackStore(tmp_path / "memory.jsonl")
     durable = MemoryWriteback(
