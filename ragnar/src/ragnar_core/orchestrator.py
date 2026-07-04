@@ -69,6 +69,7 @@ class RagnarState(TypedDict, total=False):
     qa_revision_count: int
     owner_briefing: str
     project_profile: dict[str, Any]
+    execution_mode: str
 
 
 def _repo_root() -> Path:
@@ -182,7 +183,11 @@ class RagnarOrchestrator:
         graph.add_edge(START, "intake_objective")
         graph.add_edge("intake_objective", "project_profiler")
         graph.add_edge("project_profiler", "conductor_triage")
-        graph.add_edge("conductor_triage", "architect_plan")
+        graph.add_conditional_edges(
+            "conductor_triage",
+            self.after_triage,
+            {"architect_plan": "architect_plan", "dispatch_build_roles": "dispatch_build_roles"},
+        )
         graph.add_edge("architect_plan", "conductor_review_plan")
         graph.add_conditional_edges(
             "conductor_review_plan",
@@ -210,7 +215,15 @@ class RagnarOrchestrator:
             {"workflow_engineer": "workflow_engineer", "qa_gate": "qa_gate"},
         )
         graph.add_edge("workflow_engineer", "qa_gate")
-        graph.add_edge("qa_gate", "conductor_review_qa")
+        graph.add_conditional_edges(
+            "qa_gate",
+            self.after_qa_gate,
+            {
+                "conductor_review_qa": "conductor_review_qa",
+                "approval_gate": "approval_gate",
+                "final_report": "final_report",
+            },
+        )
         graph.add_conditional_edges(
             "conductor_review_qa",
             self.after_qa_review,
@@ -302,10 +315,16 @@ class RagnarOrchestrator:
         conductor = self.registry.get("conductor")
         objective = state["objective"]
         selected_roles = self._select_build_roles(objective)
+        execution_mode = (
+            "trivial_fast_path"
+            if self.config.trivial_fast_path() and self._is_trivial_objective(objective, selected_roles)
+            else "governed_crew"
+        )
         context_queries = self._context_queries(objective, selected_roles)
         memory_context = self.memory_provider.retrieve(context_queries)
         return {
             "phase": "triaged",
+            "execution_mode": execution_mode,
             "selected_build_roles": selected_roles,
             "context_queries": context_queries,
             "memory_context": memory_context,
@@ -315,6 +334,7 @@ class RagnarOrchestrator:
                     conductor.role_id,
                     {
                         "objective": objective,
+                        "execution_mode": execution_mode,
                         "selected_build_roles": selected_roles,
                         "role_contract": _role_summary(conductor),
                         "routing_rule": "deterministic phrase and keyword routing with conservative backend default",
@@ -444,6 +464,23 @@ class RagnarOrchestrator:
         if decision.decision is not Decision.ALLOW:
             raise RuntimeError(f"QA gate is not allowed: {decision.reason}")
         build_packets = [artifact for artifact in state.get("artifacts", []) if artifact["kind"].endswith("_work_packet")]
+        selected_roles = state.get("selected_build_roles", []) or [
+            str(artifact.get("owner_role"))
+            for artifact in build_packets
+            if artifact.get("owner_role") in BUILD_ROLE_SET
+        ]
+        reviewed_diffs = [self.workspaces.diff(state["run_id"], role_id).to_dict() for role_id in selected_roles]
+        qa_workspace = {
+            "role_id": qa.role_id,
+            "enabled": self.workspaces.enabled,
+            "available": any(report["available"] for report in reviewed_diffs),
+            "git_root": str(self.workspaces.git_root()) if self.workspaces.git_root() else None,
+            "branch": None,
+            "worktree_path": None,
+            "status": "reviewing_build_worktrees" if reviewed_diffs else "no_build_worktrees",
+            "message": "QA reviews selected build role worktrees; it does not need its own build worktree.",
+            "reviewed_worktrees": reviewed_diffs,
+        }
         qa_commands = state.get("qa_commands", [])
         commands_from_profile = False
         if not qa_commands and self.config.enable_qa_profile_discovery():
@@ -458,7 +495,21 @@ class RagnarOrchestrator:
                 continue
             command_results.append(self.execution.run(command).to_dict())
         command_failed = any(result["exit_code"] != 0 for result in command_results)
-        if command_failed or denied_commands or not build_packets:
+        failed_packets = [
+            artifact
+            for artifact in build_packets
+            if (artifact.get("body", {}).get("agent_result", {}) or {}).get("status") in {"failed", "blocked"}
+        ]
+        failed_packet_facts = [
+            {
+                "kind": artifact.get("kind"),
+                "owner_role": artifact.get("owner_role"),
+                "status": (artifact.get("body", {}).get("agent_result", {}) or {}).get("status"),
+                "summary": (artifact.get("body", {}).get("agent_result", {}) or {}).get("summary"),
+            }
+            for artifact in failed_packets
+        ]
+        if command_failed or denied_commands or not build_packets or failed_packets:
             verdict = "fail"
         elif command_results:
             verdict = "pass"
@@ -469,16 +520,30 @@ class RagnarOrchestrator:
             warnings.append("No real QA command was configured for this run.")
         elif commands_from_profile:
             warnings.append("QA commands were discovered from the project profile, not explicitly configured.")
+        if failed_packets:
+            warnings.append("One or more build role packets failed or blocked; stopping without review retries.")
+
+        if state.get("execution_mode") == "trivial_fast_path" and self.config.trivial_skip_qa_agent():
+            agent_result = provider_free_result(
+                state["run_id"],
+                qa,
+                "qa_verdict",
+                f"Deterministic fast-path QA facts; verdict is {verdict}.",
+            )
+            runtime_result = None
+        else:
+            runtime_result = "pending"
 
         # The deterministic verdict above is ground truth from real exit codes and stays
         # authoritative. This adds a narrative reasoning layer on top of it -- QA's agent
         # cannot override "fail" into "pass", it can only comment on/explain the result.
         role_context = self._role_memory_context(state, qa)
         policy = self.workspaces.policies.get("qa_engineer")
-        workspace_report = self.workspaces.prepare(state["run_id"], "qa_engineer")
         observed_facts = {
             "verdict": verdict,
             "reviewed_artifacts": [artifact["kind"] for artifact in build_packets],
+            "reviewed_worktrees": reviewed_diffs,
+            "failed_packets": failed_packet_facts,
             "commands": command_results,
             "denied_commands": denied_commands,
             "warnings": warnings,
@@ -489,27 +554,29 @@ class RagnarOrchestrator:
             action="produce_qa_verdict",
             role=qa,
             model=self.config.role_model("qa_engineer"),
-            workspace=workspace_report.to_dict(),
+            workspace=qa_workspace,
             policy=policy,
             memory_context=role_context
             + [{"scope": "observed_facts", "namespace": None, "query": {}, "hits": [observed_facts], "errors": []}],
             project_profile=state.get("project_profile"),
+            compact=bool(self.config.compact_letta_invocations() and state.get("execution_mode") == "trivial_fast_path"),
         )
-        runtime_result = self.role_runtime.run(
-            qa, state["objective"], "produce_qa_verdict", role_context, invocation=invocation
-        )
-        if runtime_result.raw_reply is not None:
-            agent_result = agent_result_from_reply(state["run_id"], qa, "qa_verdict", runtime_result.raw_reply)
-        elif runtime_result.status == "provider_error":
-            agent_result = provider_error_result(state["run_id"], qa, "qa_verdict", runtime_result.message)
-        else:
-            agent_result = provider_free_result(
-                state["run_id"], qa, "qa_verdict", f"Provider-free QA reasoning; deterministic verdict is {verdict}."
+        if runtime_result == "pending":
+            runtime_result = self.role_runtime.run(
+                qa, state["objective"], "produce_qa_verdict", role_context, invocation=invocation
             )
+            if runtime_result.raw_reply is not None:
+                agent_result = agent_result_from_reply(state["run_id"], qa, "qa_verdict", runtime_result.raw_reply)
+            elif runtime_result.status == "provider_error":
+                agent_result = provider_error_result(state["run_id"], qa, "qa_verdict", runtime_result.message)
+            else:
+                agent_result = provider_free_result(
+                    state["run_id"], qa, "qa_verdict", f"Provider-free QA reasoning; deterministic verdict is {verdict}."
+                )
 
         if self.record_runs:
             self.memory_writebacks.append_many(agent_result.memory_writebacks)
-        if self.record_runs and runtime_result.transcript is not None:
+        if self.record_runs and runtime_result is not None and runtime_result.transcript is not None:
             self.agent_transcripts.append(state["run_id"], qa.role_id, "produce_qa_verdict", runtime_result.transcript)
 
         proposed_actions = []
@@ -522,7 +589,7 @@ class RagnarOrchestrator:
             proposed_actions.append({"role_id": item["role_id"], "action": item["action"], "reason": item["reason"]})
 
         return {
-            "phase": "qa_complete",
+            "phase": "qa_failed" if verdict == "fail" else "qa_complete",
             "artifacts": [
                 _artifact(
                     "qa_verdict",
@@ -530,12 +597,16 @@ class RagnarOrchestrator:
                     {
                         "verdict": verdict,
                         "reviewed_artifacts": [artifact["kind"] for artifact in build_packets],
+                        "reviewed_worktrees": reviewed_diffs,
+                        "failed_packets": failed_packet_facts,
                         "commands": command_results,
                         "denied_commands": denied_commands,
                         "warnings": warnings,
                         "agent_invocation": invocation.to_dict(),
                         "agent_result": agent_result.to_dict(),
-                        "agent_transcript_summary": self._transcript_summary(runtime_result.transcript),
+                        "agent_transcript_summary": self._transcript_summary(runtime_result.transcript)
+                        if runtime_result is not None
+                        else None,
                         "rejected_actions": rejected_actions,
                     },
                 )
@@ -681,6 +752,13 @@ class RagnarOrchestrator:
         }
 
     def _conductor_synthesize_briefing(self, state: RagnarState, report: dict[str, Any]) -> str:
+        if state.get("execution_mode") == "trivial_fast_path":
+            status_line = "Awaiting your approval." if report["blocked"] else "No approvals pending."
+            roles_line = ", ".join(report["selected_build_roles"]) or "no build roles"
+            return (
+                f"Run {report['run_id']}: {report['phase']}. Fast path completed across "
+                f"{roles_line} with {report['artifact_count']} artifacts. {status_line}"
+            )
         conductor = self.registry.get("conductor")
         decision = self.approval_broker.decide(conductor, "summarize_status")
         if decision.decision is Decision.DENY:
@@ -750,6 +828,19 @@ class RagnarOrchestrator:
             f"Run {report['run_id']}: {report['phase']}. "
             f"{report['artifact_count']} artifacts produced across {roles_line}. {status_line}"
         )
+
+    def after_triage(self, state: RagnarState) -> str:
+        if state.get("execution_mode") == "trivial_fast_path":
+            return "dispatch_build_roles"
+        return "architect_plan"
+
+    def after_qa_gate(self, state: RagnarState) -> str:
+        if state.get("execution_mode") == "trivial_fast_path":
+            qa_artifact = self._latest_artifact(state, "qa_verdict")
+            if qa_artifact and qa_artifact.get("body", {}).get("verdict") == "fail":
+                return "final_report"
+            return "approval_gate"
+        return "conductor_review_qa"
 
     def next_build_node(self, state: RagnarState) -> str:
         selected = set(state.get("selected_build_roles", []))
@@ -856,6 +947,43 @@ class RagnarOrchestrator:
             selected.append("backend_engineer")
         return selected
 
+    def _is_trivial_objective(self, objective: str, selected_roles: list[str]) -> bool:
+        if len(selected_roles) != 1:
+            return False
+        normalized = objective.lower().replace("-", " ")
+        words = _tokens(normalized)
+        trivial_terms = {
+            "hello",
+            "world",
+            "simple",
+            "static",
+            "html",
+            "page",
+            "pag",
+            "readme",
+            "copy",
+            "text",
+            "css",
+        }
+        complex_terms = {
+            "api",
+            "auth",
+            "database",
+            "migration",
+            "deploy",
+            "payment",
+            "oauth",
+            "webhook",
+            "integration",
+            "production",
+            "security",
+            "schema",
+            "backend",
+        }
+        if words & complex_terms:
+            return False
+        return bool(words & trivial_terms or "landing page" in normalized)
+
     def _merge_build_roles(self, current: list[str], requested: list[str]) -> list[str]:
         selected = set(current)
         selected.update(role_id for role_id in requested if role_id in BUILD_ROLE_SET)
@@ -906,6 +1034,7 @@ class RagnarOrchestrator:
             memory_context=role_context,
             rework_feedback=rework_feedback,
             project_profile=state.get("project_profile"),
+            compact=bool(self.config.compact_letta_invocations() and state.get("execution_mode") == "trivial_fast_path"),
         )
         runtime_result = self.role_runtime.run(role, state["objective"], action, role_context, invocation=invocation)
         if runtime_result.raw_reply is not None:

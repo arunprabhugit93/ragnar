@@ -95,6 +95,15 @@ execution:
   # whole suite. Only turn this on for a real target project, and prefer
   # passing --qa-command explicitly when in doubt.
   enable_qa_profile_discovery: false
+  # Token-saving path for obvious one-role edits such as "create a hello world
+  # HTML page": skip architect/conductor reviews, skip QA's LLM narration, and
+  # go straight through selected role -> deterministic QA facts -> approval.
+  trivial_fast_path: true
+  trivial_skip_qa_agent: true
+  # Durable Letta agents already have role contracts and operating rules in
+  # memory blocks. Send compact task packets by default instead of resending the
+  # full role contract/schema on every role turn.
+  compact_letta_invocations: true
 
 pull_requests:
   mode: draft_only

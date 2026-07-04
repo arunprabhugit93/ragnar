@@ -60,6 +60,15 @@ class RagnarConfig:
     def enable_qa_profile_discovery(self) -> bool:
         return bool(self.raw.get("execution", {}).get("enable_qa_profile_discovery", False))
 
+    def trivial_fast_path(self) -> bool:
+        return bool(self.raw.get("execution", {}).get("trivial_fast_path", True))
+
+    def trivial_skip_qa_agent(self) -> bool:
+        return bool(self.raw.get("execution", {}).get("trivial_skip_qa_agent", True))
+
+    def compact_letta_invocations(self) -> bool:
+        return bool(self.raw.get("execution", {}).get("compact_letta_invocations", True))
+
     def to_dict(self) -> dict[str, Any]:
         return self.raw
 

@@ -4,6 +4,7 @@ import json
 import sys
 import subprocess
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -124,6 +125,63 @@ def test_orchestrator_routes_html_page_typo_to_frontend() -> None:
     assert state["selected_build_roles"] == ["frontend_engineer"]
     assert "frontend_work_packet" in artifact_kinds
     assert "backend_work_packet" not in artifact_kinds
+
+
+def test_trivial_frontend_task_uses_fast_path() -> None:
+    state = run_objective(
+        "create a simple hello world html page",
+        checkpoint_db=None,
+        memory_mode="off",
+        prepare_worktrees=False,
+        record_runs=False,
+    )
+    artifact_kinds = [artifact["kind"] for artifact in state["artifacts"]]
+    qa_artifact = next(artifact for artifact in state["artifacts"] if artifact["kind"] == "qa_verdict")
+
+    assert state["execution_mode"] == "trivial_fast_path"
+    assert artifact_kinds == ["project_profile", "conductor_triage", "frontend_work_packet", "qa_verdict"]
+    assert qa_artifact["body"]["agent_transcript_summary"] is None
+    assert "conductor_plan_review" not in artifact_kinds
+    assert "conductor_qa_review" not in artifact_kinds
+    assert "integration_packet" not in artifact_kinds
+
+
+def test_trivial_fast_path_stops_on_role_failure() -> None:
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    orchestrator = RagnarOrchestrator(
+        registry,
+        config_path=Path("ragnar/ragnar.yaml"),
+        prepare_worktrees=False,
+        record_runs=False,
+        role_runtime_mode="letta",
+    )
+    orchestrator.role_runtime = _ScriptedRoleRuntime(
+        {
+            ("frontend_engineer", "edit_frontend_worktree"): [
+                json.dumps(
+                    {
+                        "run_id": "run-test",
+                        "role_id": "frontend_engineer",
+                        "status": "failed",
+                        "summary": "provider authentication failed",
+                        "proposed_patches": [],
+                        "handoffs": [],
+                        "memory_writebacks": [],
+                        "proposed_actions": [],
+                    }
+                )
+            ]
+        }
+    )
+
+    state = orchestrator.invoke("create a simple hello world html page")
+    qa_artifact = next(artifact for artifact in state["artifacts"] if artifact["kind"] == "qa_verdict")
+
+    assert state["execution_mode"] == "trivial_fast_path"
+    assert state["phase"] == "qa_failed"
+    assert qa_artifact["body"]["verdict"] == "fail"
+    assert qa_artifact["body"]["failed_packets"][0]["status"] == "failed"
+    assert "conductor_qa_review" not in [artifact["kind"] for artifact in state["artifacts"]]
 
 
 def test_orchestrator_includes_agent_contract_and_writeback_format() -> None:
@@ -574,6 +632,20 @@ def test_call_agent_omits_peer_block_when_disabled() -> None:
     assert "send_message_to_agents_matching_tags" not in prompt_content
 
 
+def test_call_agent_uses_compact_contract_when_requested() -> None:
+    fake_client = _FakeLettaClient(_FakeResponse([_FakeAssistantMessage('{"status":"completed","summary":"ok","proposed_patches":[],"handoffs":[],"memory_writebacks":[],"proposed_actions":[]}')]))
+    runtime = RoleRuntime(Path("ragnar/.ragnar/letta_agents.json"), mode="letta")
+    runtime._client = fake_client
+
+    invocation = replace(_build_test_invocation("frontend_engineer"), compact=True)
+    runtime._call_agent("agent-under-test", invocation)
+
+    prompt_content = fake_client.agents.messages.calls[0]["messages"][0]["content"]
+    assert '"allowed_path_globs"' in prompt_content
+    assert '"role_contract"' not in prompt_content
+    assert '"expected_output_schema"' not in prompt_content
+
+
 def test_agent_transcript_store_appends_and_filters_by_run_id(tmp_path: Path) -> None:
     store = AgentTranscriptStore(tmp_path / "agent_transcripts.jsonl")
     store.append("run-1", "backend_engineer", "edit_backend_worktree", {"agent_id": "a1", "max_steps": 7, "messages": []})
@@ -591,6 +663,9 @@ def test_revision_caps_configurable_via_ragnar_config() -> None:
 
     assert config.max_plan_revisions(default=MAX_PLAN_REVISIONS) == 1
     assert config.max_qa_revisions(default=2) == 3
+    assert config.trivial_fast_path() is True
+    assert config.trivial_skip_qa_agent() is True
+    assert config.compact_letta_invocations() is True
 
     default_config = RagnarConfig(version="0.1", raw={})
     assert default_config.max_plan_revisions(default=MAX_PLAN_REVISIONS) == MAX_PLAN_REVISIONS
@@ -897,6 +972,8 @@ def test_qa_gate_does_not_run_commands_from_profile_when_discovery_disabled() ->
     assert fake_execution.calls == []
     qa_artifact = result["artifacts"][0]
     assert qa_artifact["body"]["verdict"] == "pass_with_warnings"
+    assert qa_artifact["body"]["agent_invocation"]["workspace"]["status"] == "reviewing_build_worktrees"
+    assert qa_artifact["body"]["agent_invocation"]["workspace"]["reviewed_worktrees"][0]["role_id"] == "backend_engineer"
 
 
 def test_qa_gate_discovers_and_runs_command_from_project_profile() -> None:

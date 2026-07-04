@@ -74,6 +74,7 @@ class RoleInvocationContract:
     expected_output_schema: dict[str, Any]
     rework_feedback: dict[str, Any] | None = None
     project_profile: dict[str, Any] | None = None
+    compact: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -206,6 +207,7 @@ def build_invocation_contract(
     rework_feedback: dict[str, Any] | None = None,
     expected_output_schema: dict[str, Any] | None = None,
     project_profile: dict[str, Any] | None = None,
+    compact: bool = False,
 ) -> RoleInvocationContract:
     return RoleInvocationContract(
         schema_version=SCHEMA_VERSION,
@@ -223,6 +225,7 @@ def build_invocation_contract(
         expected_output_schema=expected_output_schema or expected_role_output_schema(),
         rework_feedback=rework_feedback,
         project_profile=project_profile,
+        compact=compact,
     )
 
 
@@ -508,3 +511,39 @@ def review_result_from_reply(run_id: str, role: RoleContract, reply_text: str) -
 
 def contract_json(contract: RoleInvocationContract) -> str:
     return json.dumps(contract.to_dict(), indent=2, sort_keys=True)
+
+
+def compact_contract_json(contract: RoleInvocationContract) -> str:
+    profile = contract.project_profile or {}
+    compact_profile = {
+        key: profile.get(key)
+        for key in ("languages", "frameworks", "package_managers", "test_commands", "domain_hints")
+        if profile.get(key)
+    }
+    payload = {
+        "schema_version": contract.schema_version,
+        "run_id": contract.run_id,
+        "role_id": contract.role_id,
+        "objective": contract.objective,
+        "action": contract.action,
+        "workspace": {
+            "available": contract.workspace.get("available"),
+            "status": contract.workspace.get("status"),
+            "worktree_path": contract.workspace.get("worktree_path"),
+            "reviewed_worktrees": contract.workspace.get("reviewed_worktrees"),
+        },
+        "allowed_path_globs": contract.file_policy.get("allowed_path_globs", []),
+        "allowed_command_families": contract.command_policy.get("allowed_command_families", []),
+        "project_profile": compact_profile,
+        "rework_feedback": contract.rework_feedback,
+        "output_rules": [
+            "Return JSON only.",
+            "For edit actions, put every file change in proposed_patches as unified_diff.",
+            "Do not claim edits were applied; Ragnar applies patches externally.",
+            "Do not propose outward actions unless a patch is proposed.",
+            "Use proposed_actions only for owner-approved outward actions such as push_branch.",
+            "Keep memory_writebacks short and durable; do not store one-off run noise.",
+        ],
+        "required_fields": contract.expected_output_schema.get("required_fields", []),
+    }
+    return json.dumps(payload, indent=2, sort_keys=True)

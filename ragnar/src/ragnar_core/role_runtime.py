@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from .contracts import RoleInvocationContract, contract_json
+from .contracts import RoleInvocationContract, compact_contract_json, contract_json
 from .role_registry import RoleContract
 
 
@@ -172,7 +172,8 @@ class RoleRuntime:
         )
         if self.enable_agent_messaging:
             prompt += self._peer_messaging_block(invocation)
-        prompt += f"\n\n{contract_json(invocation)}"
+        packet = compact_contract_json(invocation) if invocation.compact else contract_json(invocation)
+        prompt += f"\n\n{packet}"
 
         response = client.agents.messages.create(
             agent_id=agent_id,
