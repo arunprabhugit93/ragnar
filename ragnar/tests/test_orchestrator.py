@@ -15,6 +15,7 @@ from ragnar_core.conductor_decision import make_conductor_decision
 from ragnar_core.context_broker import ContextBroker, ContextBudget
 from ragnar_core.contracts import MemoryWriteback, agent_result_from_reply, build_invocation_contract, provider_error_result
 from ragnar_core.edit_adapter import SafePatchAdapter, extract_changed_files
+from ragnar_core.intent_analyzer import analyze_intent, merge_clarification
 from ragnar_core.letta_provisioner import (
     ROLE_AGENT_DEFINITION_VERSION,
     create_or_reuse_agents,
@@ -144,7 +145,7 @@ def test_orchestrator_does_not_require_memory_provider() -> None:
 
 def test_orchestrator_routes_html_page_typo_to_frontend() -> None:
     state = run_objective(
-        "create a simple hello world html pag",
+        "create a simple hello world html pag in this repo",
         checkpoint_db=None,
         memory_mode="off",
     )
@@ -157,7 +158,7 @@ def test_orchestrator_routes_html_page_typo_to_frontend() -> None:
 
 def test_trivial_frontend_task_uses_fast_path() -> None:
     state = run_objective(
-        "create a simple hello world html page",
+        "create a simple hello world html page in this repo",
         checkpoint_db=None,
         memory_mode="off",
         prepare_worktrees=False,
@@ -167,7 +168,7 @@ def test_trivial_frontend_task_uses_fast_path() -> None:
     qa_artifact = next(artifact for artifact in state["artifacts"] if artifact["kind"] == "qa_verdict")
 
     assert state["execution_mode"] == "fast_path"
-    assert artifact_kinds == ["project_profile", "conductor_triage", "frontend_work_packet", "qa_verdict"]
+    assert artifact_kinds == ["intent_analysis", "project_profile", "conductor_triage", "frontend_work_packet", "qa_verdict"]
     assert qa_artifact["body"]["agent_transcript_summary"] is None
     assert "conductor_plan_review" not in artifact_kinds
     assert "conductor_qa_review" not in artifact_kinds
@@ -220,7 +221,7 @@ def test_trivial_fast_path_stops_on_role_failure() -> None:
         }
     )
 
-    state = orchestrator.invoke("create a simple hello world html page")
+    state = orchestrator.invoke("create a simple hello world html page in this repo")
     qa_artifact = next(artifact for artifact in state["artifacts"] if artifact["kind"] == "qa_verdict")
 
     assert state["execution_mode"] == "fast_path"
@@ -228,6 +229,35 @@ def test_trivial_fast_path_stops_on_role_failure() -> None:
     assert qa_artifact["body"]["verdict"] == "fail"
     assert qa_artifact["body"]["failed_packets"][0]["status"] == "failed"
     assert "conductor_qa_review" not in [artifact["kind"] for artifact in state["artifacts"]]
+
+
+def test_ambiguous_file_creation_pauses_for_clarification() -> None:
+    state = run_objective(
+        "create a simple hello world html page",
+        checkpoint_db=None,
+        memory_mode="off",
+        prepare_worktrees=False,
+        record_runs=False,
+    )
+
+    assert state["phase"] == "needs_clarification"
+    assert state["blocked"] is True
+    assert state["intent_analysis"]["missing_slots"] == ["target_project", "target_location", "persistence_mode"]
+    assert "Where should I create" in state["clarification_question"]
+    assert [artifact["kind"] for artifact in state["artifacts"]] == ["intent_analysis"]
+
+
+def test_intent_analyzer_accepts_explicit_repo_or_path() -> None:
+    repo = analyze_intent("create a simple hello world html page in this repo")
+    path = analyze_intent("create a simple hello world html page at frontend/hello.html")
+
+    assert repo.needs_clarification is False
+    assert repo.target_project == "current_repo"
+    assert path.needs_clarification is False
+    assert path.target_location == "frontend/hello.html"
+    assert merge_clarification("create a simple hello world html page", "in this repo").endswith(
+        "User clarification: in this repo"
+    )
 
 
 def test_research_objective_spawns_researcher_before_architect() -> None:
@@ -560,6 +590,25 @@ def test_chat_session_runs_objective_once() -> None:
     assert "roles: frontend_engineer" in output
     assert "approval required:" not in output
     assert session.last_run_id is not None
+
+
+def test_chat_session_carries_clarification_answer() -> None:
+    session = ChatSession(
+        roles_path=Path("ragnar/roles/ragnar_roles.yaml"),
+        config_path=Path("ragnar/ragnar.yaml"),
+        memory_mode="off",
+        qa_commands=[],
+        prepare_worktrees=False,
+        record_runs=False,
+    )
+
+    first = session.run_objective("create a simple hello world html page")
+    second = session.run_objective("in this repo")
+
+    assert "phase: needs_clarification" in first
+    assert "clarification required:" in first
+    assert "phase: approved_to_finish" in second
+    assert session.pending_clarification is None
 
 
 def test_chat_render_json_mode() -> None:

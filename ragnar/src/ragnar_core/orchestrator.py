@@ -31,6 +31,7 @@ from .context_memory import ContextMemoryProvider, MemoryMode
 from .edit_adapter import SafePatchAdapter
 from .execution_profiles import profile_by_name
 from .execution import LocalExecutionAdapter
+from .intent_analyzer import analyze_intent
 from .memory_writeback import MemoryWritebackStore, default_writeback_path
 from .observability import RunRecorder, default_runs_path
 from .pr_adapter import PullRequestDraftStore, build_pr_draft, default_pr_draft_dir
@@ -76,6 +77,8 @@ class RagnarState(TypedDict, total=False):
     project_profile: dict[str, Any]
     execution_mode: str
     conductor_decision: dict[str, Any]
+    intent_analysis: dict[str, Any]
+    clarification_question: str
 
 
 def _repo_root() -> Path:
@@ -185,6 +188,8 @@ class RagnarOrchestrator:
 
         graph = StateGraph(RagnarState)
         graph.add_node("intake_objective", self.intake_objective)
+        graph.add_node("intent_analyzer", self.intent_analyzer)
+        graph.add_node("clarification_gate", self.clarification_gate)
         graph.add_node("project_profiler", self.project_profiler)
         graph.add_node("conductor_triage", self.conductor_triage)
         graph.add_node("researcher", self.researcher)
@@ -201,7 +206,13 @@ class RagnarOrchestrator:
         graph.add_node("final_report", self.final_report)
 
         graph.add_edge(START, "intake_objective")
-        graph.add_edge("intake_objective", "project_profiler")
+        graph.add_edge("intake_objective", "intent_analyzer")
+        graph.add_conditional_edges(
+            "intent_analyzer",
+            self.after_intent_analysis,
+            {"clarification_gate": "clarification_gate", "project_profiler": "project_profiler"},
+        )
+        graph.add_edge("clarification_gate", "final_report")
         graph.add_edge("project_profiler", "conductor_triage")
         graph.add_conditional_edges(
             "conductor_triage",
@@ -333,6 +344,34 @@ class RagnarOrchestrator:
         return {
             "phase": "intake",
             "audit_events": [_event("intake_objective", "accepted owner objective", objective=objective)],
+        }
+
+    def intent_analyzer(self, state: RagnarState) -> dict[str, Any]:
+        analysis = analyze_intent(state["objective"])
+        analysis_dict = analysis.to_dict()
+        return {
+            "phase": "intent_analyzed",
+            "intent_analysis": analysis_dict,
+            "artifacts": [_artifact("intent_analysis", "conductor", analysis_dict)],
+            "audit_events": [
+                _event(
+                    "intent_analyzer",
+                    "classified objective intent",
+                    intent=analysis.intent,
+                    needs_clarification=analysis.needs_clarification,
+                    missing_slots=analysis.missing_slots,
+                )
+            ],
+        }
+
+    def clarification_gate(self, state: RagnarState) -> dict[str, Any]:
+        analysis = state.get("intent_analysis", {})
+        question = str(analysis.get("question") or "Please clarify the target before Ragnar changes files.")
+        return {
+            "phase": "needs_clarification",
+            "blocked": True,
+            "clarification_question": question,
+            "audit_events": [_event("clarification_gate", "paused for owner clarification", question=question)],
         }
 
     def project_profiler(self, state: RagnarState) -> dict[str, Any]:
@@ -832,6 +871,8 @@ class RagnarOrchestrator:
         }
 
     def _conductor_synthesize_briefing(self, state: RagnarState, report: dict[str, Any]) -> str:
+        if state.get("phase") == "needs_clarification":
+            return str(state.get("clarification_question") or "Ragnar needs clarification before continuing.")
         if state.get("execution_mode") in {"fast_path", "standard_path"}:
             status_line = "Awaiting your approval." if report["blocked"] else "No approvals pending."
             roles_line = ", ".join(report["selected_build_roles"]) or "no build roles"
@@ -909,6 +950,11 @@ class RagnarOrchestrator:
             f"Run {report['run_id']}: {report['phase']}. "
             f"{report['artifact_count']} artifacts produced across {roles_line}. {status_line}"
         )
+
+    def after_intent_analysis(self, state: RagnarState) -> str:
+        if state.get("intent_analysis", {}).get("needs_clarification"):
+            return "clarification_gate"
+        return "project_profiler"
 
     def after_triage(self, state: RagnarState) -> str:
         decision = state.get("conductor_decision", {})

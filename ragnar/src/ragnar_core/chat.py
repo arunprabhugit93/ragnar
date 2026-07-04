@@ -8,6 +8,7 @@ from typing import Any
 
 from .approval_store import ApprovalStore, default_approvals_path
 from .config import default_config_path
+from .intent_analyzer import merge_clarification
 from .orchestrator import run_objective
 from .role_runtime import RoleRuntimeMode
 
@@ -56,6 +57,11 @@ def render_state(state: dict[str, Any], show_json: bool = False) -> str:
         f"phase: {state.get('phase')}",
         f"roles: {', '.join(state.get('selected_build_roles', [])) or 'none'}",
     ]
+
+    if state.get("phase") == "needs_clarification":
+        lines.append("")
+        lines.append("clarification required:")
+        lines.append(str(state.get("clarification_question") or state.get("owner_briefing") or "Please clarify the target."))
 
     if role_packets:
         lines.append("")
@@ -116,9 +122,13 @@ class ChatSession:
         self.role_runtime_mode = role_runtime_mode
         self.last_objective: str | None = None
         self.last_run_id: str | None = None
+        self.pending_clarification: dict[str, str] | None = None
         self.approvals = ApprovalStore(default_approvals_path(_repo_root()))
 
     def run_objective(self, objective: str, run_id: str | None = None) -> str:
+        if self.pending_clarification and run_id is None:
+            objective = merge_clarification(self.pending_clarification["objective"], objective)
+            self.pending_clarification = None
         self.last_objective = objective
         state = run_objective(
             objective,
@@ -133,6 +143,13 @@ class ChatSession:
             role_runtime_mode=self.role_runtime_mode,
         )
         self.last_run_id = str(state["run_id"])
+        if state.get("phase") == "needs_clarification":
+            self.pending_clarification = {
+                "objective": objective,
+                "question": str(state.get("clarification_question") or ""),
+            }
+        else:
+            self.pending_clarification = None
         return render_state(state, self.show_json)
 
     def handle_command(self, line: str) -> str | None:
@@ -167,6 +184,7 @@ class ChatSession:
         if command == "/rerun":
             if not self.last_objective:
                 return "No previous objective to rerun."
+            self.pending_clarification = None
             return self.run_objective(self.last_objective, self.last_run_id)
         return f"Unknown command: {command}. Try /help."
 
