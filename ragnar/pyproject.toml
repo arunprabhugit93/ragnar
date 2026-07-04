@@ -28,6 +28,7 @@ ragnar-memory-writebacks = "ragnar_core.memory_writeback:main"
 ragnar-agent-transcripts = "ragnar_core.agent_transcripts:main"
 ragnar-pr-draft = "ragnar_core.pr_adapter:main"
 ragnar-chat = "ragnar_core.chat:main"
+ragnar-run-ledger = "ragnar_core.run_ledger:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

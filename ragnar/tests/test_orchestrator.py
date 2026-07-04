@@ -11,7 +11,8 @@ from typing import Any
 from ragnar_core.agent_transcripts import AgentTranscriptStore
 from ragnar_core.chat import ChatSession, render_state
 from ragnar_core.config import ModelConfig, RagnarConfig, load_config
-from ragnar_core.contracts import agent_result_from_reply, build_invocation_contract, provider_error_result
+from ragnar_core.context_broker import ContextBroker, ContextBudget
+from ragnar_core.contracts import MemoryWriteback, agent_result_from_reply, build_invocation_contract, provider_error_result
 from ragnar_core.edit_adapter import SafePatchAdapter, extract_changed_files
 from ragnar_core.letta_provisioner import (
     ROLE_AGENT_DEFINITION_VERSION,
@@ -20,11 +21,13 @@ from ragnar_core.letta_provisioner import (
     _sync_agent_definition_blocks,
 )
 from ragnar_core.execution import CommandResult
+from ragnar_core.memory_writeback import MemoryWritebackStore
 from ragnar_core.orchestrator import MAX_PLAN_REVISIONS, RagnarOrchestrator, run_objective
 from ragnar_core.pr_adapter import build_pr_draft
 from ragnar_core.project_profiler import build_project_profile, qa_commands_from_profile
 from ragnar_core.role_registry import load_role_registry
 from ragnar_core.role_runtime import RoleRuntime, RoleRuntimeResult
+from ragnar_core.run_ledger import RunLedgerStore, record_from_artifact
 from ragnar_core.workspace import RoleWorkspaceManager, command_family, default_workspace_policies
 
 
@@ -35,8 +38,10 @@ class _ScriptedRoleRuntime:
     def __init__(self, scripted: dict[tuple[str, str], list[str]]) -> None:
         self.scripted = scripted
         self._call_counts: dict[tuple[str, str], int] = {}
+        self.invocations: list[Any] = []
 
     def run(self, role: Any, objective: str, action: str, context_hits: list[dict[str, Any]], invocation: Any = None) -> RoleRuntimeResult:
+        self.invocations.append(invocation)
         used_context_hits = sum(len(item.get("hits", [])) for item in context_hits)
         key = (role.role_id, action)
         replies = self.scripted.get(key)
@@ -64,6 +69,28 @@ class _ScriptedRoleRuntime:
             status="no_real_letta_agent_manifest",
             raw_reply=None,
         )
+
+
+class _FakeMemoryProvider:
+    def retrieve(self, queries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "query": query,
+                "hits": [
+                    {
+                        "provider": "pgvector",
+                        "namespace": query.get("namespace"),
+                        "scope": query.get("scope"),
+                        "text": f"memory {index} " + ("x" * 2000),
+                        "score": 0.9 - (index * 0.01),
+                        "metadata": {},
+                    }
+                    for index in range(4)
+                ],
+                "errors": [],
+            }
+            for query in queries
+        ]
 
 
 def test_orchestrator_routes_all_build_roles() -> None:
@@ -182,6 +209,131 @@ def test_trivial_fast_path_stops_on_role_failure() -> None:
     assert qa_artifact["body"]["verdict"] == "fail"
     assert qa_artifact["body"]["failed_packets"][0]["status"] == "failed"
     assert "conductor_qa_review" not in [artifact["kind"] for artifact in state["artifacts"]]
+
+
+def test_context_broker_bounds_memory_hits_and_chars(tmp_path: Path) -> None:
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    broker = ContextBroker(
+        registry,
+        _FakeMemoryProvider(),  # type: ignore[arg-type]
+        RunLedgerStore(tmp_path / "ledger.jsonl"),
+        ContextBudget(max_total_hits=3, max_hits_per_role=2, max_hit_chars=40),
+    )
+
+    _queries, lookups = broker.retrieve_for_roles("build frontend page", ["frontend_engineer"])
+    hits = [hit for lookup in lookups for hit in lookup["hits"]]
+
+    assert len(hits) == 3
+    assert all(len(hit["text"]) <= 40 for hit in hits)
+
+
+def test_context_broker_compacts_handoff_inputs(tmp_path: Path) -> None:
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    broker = ContextBroker(
+        registry,
+        _FakeMemoryProvider(),  # type: ignore[arg-type]
+        RunLedgerStore(tmp_path / "ledger.jsonl"),
+        ContextBudget(max_handoffs=1, max_handoff_chars=30),
+    )
+    state: Any = {
+        "artifacts": [
+            {
+                "kind": "backend_work_packet",
+                "owner_role": "backend_engineer",
+                "body": {
+                    "agent_result": {"status": "proposed", "summary": "A" * 200, "proposed_patches": [{"x": 1}]},
+                    "handoffs": [{"to_role": "frontend_engineer"}],
+                    "diff": {"changed_files": ["src/api/users.py"]},
+                },
+            }
+        ]
+    }
+
+    handoffs = broker.handoff_inputs(state, "frontend_engineer")
+
+    assert handoffs == [
+        {
+            "from_role": "backend_engineer",
+            "artifact_kind": "backend_work_packet",
+            "status": "proposed",
+            "summary": "A" * 30,
+            "changed_files": ["src/api/users.py"],
+            "patch_count": 1,
+        }
+    ]
+
+
+def test_memory_writebacks_are_curated_and_deduped(tmp_path: Path) -> None:
+    store = MemoryWritebackStore(tmp_path / "memory.jsonl")
+    durable = MemoryWriteback(
+        role_id="frontend_engineer",
+        namespace="roles/frontend_engineer",
+        scope="private",
+        text="Frontend lesson: standalone pages in this repo live under frontend/.",
+        tags=["lesson", "frontend"],
+        source_run_id="run-1",
+        source_artifact="frontend_work_packet",
+    )
+    provider_error = MemoryWriteback(
+        role_id="frontend_engineer",
+        namespace="roles/frontend_engineer",
+        scope="private",
+        text="Provider-backed role call failed for frontend_engineer: authentication failed.",
+        tags=["provider_error"],
+        source_run_id="run-1",
+        source_artifact="frontend_work_packet",
+    )
+
+    assert store.append_many([durable, durable, provider_error]) == 2
+    records = store.list()
+
+    assert len(records) == 2
+    assert records[0]["classification"] == "role_lesson"
+    assert records[0]["promote"] is True
+    assert records[1]["classification"] == "provider_error"
+    assert records[1]["promote"] is False
+
+
+def test_role_context_carries_prior_role_handoff_without_full_repeat() -> None:
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    orchestrator = RagnarOrchestrator(
+        registry,
+        config_path=Path("ragnar/ragnar.yaml"),
+        prepare_worktrees=True,
+        record_runs=False,
+    )
+    runtime = _ScriptedRoleRuntime(
+        {
+            ("backend_engineer", "edit_backend_worktree"): [
+                json.dumps(
+                    {
+                        "run_id": "run-test",
+                        "role_id": "backend_engineer",
+                        "status": "proposed",
+                        "summary": "Added GET /api/profile returning id, name, email.",
+                        "proposed_patches": [
+                            {
+                                "patch_id": "api",
+                                "summary": "api",
+                                "unified_diff": "--- /dev/null\n+++ src/api/profile.py\n@@ -0,0 +1 @@\n+value = 1\n",
+                            }
+                        ],
+                        "handoffs": [],
+                        "memory_writebacks": [],
+                        "proposed_actions": [],
+                    }
+                )
+            ]
+        }
+    )
+    orchestrator.role_runtime = runtime
+
+    orchestrator.invoke("build backend API and frontend page")
+    frontend_invocation = next(item for item in runtime.invocations if item and item.role_id == "frontend_engineer")
+
+    assert frontend_invocation.handoff_inputs[0]["from_role"] == "backend_engineer"
+    assert frontend_invocation.handoff_inputs[0]["changed_files"] == ["src/api/profile.py"]
+    assert "GET /api/profile" in frontend_invocation.handoff_inputs[0]["summary"]
 
 
 def test_orchestrator_includes_agent_contract_and_writeback_format() -> None:

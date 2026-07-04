@@ -14,6 +14,7 @@ from .agent_transcripts import AgentTranscriptStore, default_transcripts_path
 from .approval_store import ApprovalStore, default_approvals_path
 from .approval_broker import ApprovalBroker, Decision
 from .config import RagnarConfig, default_config_path, load_config
+from .context_broker import ContextBroker, ContextBudget
 from .contracts import (
     agent_result_from_reply,
     build_invocation_contract,
@@ -33,6 +34,7 @@ from .pr_adapter import PullRequestDraftStore, build_pr_draft, default_pr_draft_
 from .project_profiler import build_project_profile, qa_commands_from_profile
 from .role_runtime import RoleRuntime, RoleRuntimeMode, default_manifest_path, extract_json_object
 from .role_registry import RoleContract, RoleRegistry, load_role_registry
+from .run_ledger import RunLedgerStore, default_run_ledger_path, record_from_artifact
 from .workspace import RoleWorkspaceManager
 
 
@@ -151,6 +153,19 @@ class RagnarOrchestrator:
         )
         self.approval_store = ApprovalStore(approvals_path or default_approvals_path(repo_root))
         self.memory_writebacks = MemoryWritebackStore(default_writeback_path(repo_root))
+        self.run_ledger = RunLedgerStore(default_run_ledger_path(repo_root))
+        self.context_broker = ContextBroker(
+            self.registry,
+            self.memory_provider,
+            self.run_ledger,
+            ContextBudget(
+                max_total_hits=self.config.memory_max_total_hits(),
+                max_hits_per_role=self.config.memory_max_hits_per_role(),
+                max_hit_chars=self.config.memory_max_hit_chars(),
+                max_handoffs=self.config.memory_max_handoffs(),
+                max_handoff_chars=self.config.memory_max_handoff_chars(),
+            ),
+        )
         self.agent_transcripts = AgentTranscriptStore(default_transcripts_path(repo_root))
         self.pr_drafts = PullRequestDraftStore(default_pr_draft_dir(repo_root))
         self.recorder = RunRecorder(runs_path or default_runs_path(repo_root))
@@ -320,8 +335,7 @@ class RagnarOrchestrator:
             if self.config.trivial_fast_path() and self._is_trivial_objective(objective, selected_roles)
             else "governed_crew"
         )
-        context_queries = self._context_queries(objective, selected_roles)
-        memory_context = self.memory_provider.retrieve(context_queries)
+        context_queries, memory_context = self.context_broker.retrieve_for_roles(objective, selected_roles)
         return {
             "phase": "triaged",
             "execution_mode": execution_mode,
@@ -990,21 +1004,7 @@ class RagnarOrchestrator:
         return [role_id for role_id in BUILD_SEQUENCE if role_id in selected]
 
     def _context_queries(self, objective: str, selected_roles: list[str]) -> list[dict[str, Any]]:
-        queries = [{"scope": "shared", "namespace": "project_context", "query": objective}]
-        for role_id in selected_roles:
-            role = self.registry.get(role_id)
-            queries.append({"scope": "private", "namespace": role.private_memory_namespace, "query": objective})
-            for namespace in role.memory.get("shared_namespaces", []):
-                queries.append({"scope": "shared", "namespace": namespace, "query": objective})
-        seen = set()
-        deduped = []
-        for query in queries:
-            key = (query["scope"], query["namespace"], query["query"])
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped.append(query)
-        return deduped
+        return self.context_broker.context_queries(objective, selected_roles)
 
     def _role_execution_artifact(
         self,
@@ -1019,6 +1019,41 @@ class RagnarOrchestrator:
         decision = self.approval_broker.decide(role, action)
         if decision.decision is Decision.DENY:
             raise RuntimeError(f"{role_id} cannot run {action}: {decision.reason}")
+        if rework_feedback is None:
+            existing = self.context_broker.already_done(state, role_id, action)
+            if existing:
+                return {
+                    "phase": f"{role_id}_already_done",
+                    "artifacts": [
+                        _artifact(
+                            output_kind,
+                            role_id,
+                            {
+                                "objective": state["objective"],
+                                "allowed_action": action,
+                                "agent_result": {
+                                    "schema_version": SCHEMA_VERSION,
+                                    "run_id": state["run_id"],
+                                    "role_id": role_id,
+                                    "status": "completed",
+                                    "summary": f"Skipped duplicate work; prior artifact already exists: {existing.get('artifact_kind')}.",
+                                    "proposed_patches": [],
+                                    "handoffs": [],
+                                    "memory_writebacks": [],
+                                    "proposed_actions": [],
+                                    "requested_handoff_roles": [],
+                                },
+                                "already_done": existing,
+                                "handoffs": [],
+                                "memory_writebacks": [],
+                                "patch_reports": [],
+                                "notes": notes,
+                            },
+                        )
+                    ],
+                    "proposed_actions": [],
+                    "audit_events": [_event(role_id, "skipped duplicate role work", action=action)],
+                }
         role_context = self._role_memory_context(state, role)
         workspace_report = self.workspaces.prepare(state["run_id"], role_id)
         diff_report = self.workspaces.diff(state["run_id"], role_id) if workspace_report.available else None
@@ -1032,6 +1067,7 @@ class RagnarOrchestrator:
             workspace=workspace_report.to_dict(),
             policy=policy,
             memory_context=role_context,
+            handoff_inputs=self.context_broker.handoff_inputs(state, role_id),
             rework_feedback=rework_feedback,
             project_profile=state.get("project_profile"),
             compact=bool(self.config.compact_letta_invocations() and state.get("execution_mode") == "trivial_fast_path"),
@@ -1093,41 +1129,40 @@ class RagnarOrchestrator:
             else []
         )
         next_selected_roles = self._merge_build_roles(state.get("selected_build_roles", []), requested_handoffs)
+        artifact_body = {
+            "objective": state["objective"],
+            "allowed_action": action,
+            "policy_decision": decision.decision.value,
+            "role_contract": _role_summary(role),
+            "context_queries": [
+                query
+                for query in state.get("context_queries", [])
+                if query.get("namespace") in role.memory.get("shared_namespaces", [])
+                or query.get("namespace") == role.private_memory_namespace
+            ],
+            "memory_context": role_context,
+            "role_runtime": role_runtime_dict,
+            "agent_transcript_summary": self._transcript_summary(runtime_result.transcript),
+            "workspace": workspace_report.to_dict(),
+            "diff": diff_report.to_dict() if diff_report else None,
+            "agent_invocation": invocation.to_dict(),
+            "agent_result": agent_result.to_dict(),
+            "handoffs": [handoff.to_dict() for handoff in agent_result.handoffs],
+            "requested_handoff_roles": requested_handoffs,
+            "memory_writebacks": [writeback.to_dict() for writeback in agent_result.memory_writebacks],
+            "patch_reports": patch_reports,
+            "rejected_actions": rejected_actions,
+            "notes": notes,
+        }
+        artifact = _artifact(output_kind, role_id, artifact_body)
+        ledger_record = record_from_artifact(state["run_id"], artifact)
+        if self.record_runs and ledger_record is not None:
+            self.run_ledger.append(ledger_record)
 
         return {
             "phase": f"{role_id}_complete",
             "selected_build_roles": next_selected_roles,
-            "artifacts": [
-                _artifact(
-                    output_kind,
-                    role_id,
-                    {
-                        "objective": state["objective"],
-                        "allowed_action": action,
-                        "policy_decision": decision.decision.value,
-                        "role_contract": _role_summary(role),
-                        "context_queries": [
-                            query
-                            for query in state.get("context_queries", [])
-                            if query.get("namespace") in role.memory.get("shared_namespaces", [])
-                            or query.get("namespace") == role.private_memory_namespace
-                        ],
-                        "memory_context": role_context,
-                        "role_runtime": role_runtime_dict,
-                        "agent_transcript_summary": self._transcript_summary(runtime_result.transcript),
-                        "workspace": workspace_report.to_dict(),
-                        "diff": diff_report.to_dict() if diff_report else None,
-                        "agent_invocation": invocation.to_dict(),
-                        "agent_result": agent_result.to_dict(),
-                        "handoffs": [handoff.to_dict() for handoff in agent_result.handoffs],
-                        "requested_handoff_roles": requested_handoffs,
-                        "memory_writebacks": [writeback.to_dict() for writeback in agent_result.memory_writebacks],
-                        "patch_reports": patch_reports,
-                        "rejected_actions": rejected_actions,
-                        "notes": notes,
-                    },
-                )
-            ],
+            "artifacts": [artifact],
             "proposed_actions": proposed_actions,
             "audit_events": [
                 _event(
@@ -1140,14 +1175,7 @@ class RagnarOrchestrator:
         }
 
     def _role_memory_context(self, state: RagnarState, role: RoleContract) -> list[dict[str, Any]]:
-        namespaces = set(role.memory.get("shared_namespaces", []))
-        namespaces.add(role.private_memory_namespace)
-        role_context = []
-        for item in state.get("memory_context", []):
-            query = item.get("query", {})
-            if query.get("namespace") in namespaces:
-                role_context.append(item)
-        return role_context
+        return self.context_broker.role_context(state, role)
 
     def _latest_artifact(self, state: RagnarState, kind: str) -> dict[str, Any] | None:
         return next((artifact for artifact in reversed(state.get("artifacts", [])) if artifact["kind"] == kind), None)

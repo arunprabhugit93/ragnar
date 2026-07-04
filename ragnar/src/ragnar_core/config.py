@@ -69,6 +69,21 @@ class RagnarConfig:
     def compact_letta_invocations(self) -> bool:
         return bool(self.raw.get("execution", {}).get("compact_letta_invocations", True))
 
+    def memory_max_total_hits(self) -> int:
+        return int(self.raw.get("memory", {}).get("max_total_hits", 5))
+
+    def memory_max_hits_per_role(self) -> int:
+        return int(self.raw.get("memory", {}).get("max_hits_per_role", 2))
+
+    def memory_max_hit_chars(self) -> int:
+        return int(self.raw.get("memory", {}).get("max_hit_chars", 900))
+
+    def memory_max_handoffs(self) -> int:
+        return int(self.raw.get("memory", {}).get("max_handoffs", 4))
+
+    def memory_max_handoff_chars(self) -> int:
+        return int(self.raw.get("memory", {}).get("max_handoff_chars", 700))
+
     def to_dict(self) -> dict[str, Any]:
         return self.raw
 

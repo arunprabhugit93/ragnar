@@ -61,6 +61,11 @@ models:
 memory:
   mode: auto
   max_hits_per_query: 3
+  max_total_hits: 5
+  max_hits_per_role: 2
+  max_hit_chars: 900
+  max_handoffs: 4
+  max_handoff_chars: 700
   writeback:
     local_jsonl: .ragnar/memory_writebacks.jsonl
 
