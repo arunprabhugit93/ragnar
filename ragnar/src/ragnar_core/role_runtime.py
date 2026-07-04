@@ -170,7 +170,7 @@ class RoleRuntime:
             "close attention to any raw command output (stdout/stderr) it carries for exact "
             "error detail."
         )
-        if self.enable_agent_messaging:
+        if self.enable_agent_messaging and invocation.agent_messaging_allowed:
             prompt += self._peer_messaging_block(invocation)
         packet = compact_contract_json(invocation) if invocation.compact else contract_json(invocation)
         prompt += f"\n\n{packet}"

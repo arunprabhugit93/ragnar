@@ -75,6 +75,7 @@ class RoleInvocationContract:
     rework_feedback: dict[str, Any] | None = None
     project_profile: dict[str, Any] | None = None
     compact: bool = False
+    agent_messaging_allowed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -208,6 +209,7 @@ def build_invocation_contract(
     expected_output_schema: dict[str, Any] | None = None,
     project_profile: dict[str, Any] | None = None,
     compact: bool = False,
+    agent_messaging_allowed: bool = False,
 ) -> RoleInvocationContract:
     return RoleInvocationContract(
         schema_version=SCHEMA_VERSION,
@@ -226,6 +228,7 @@ def build_invocation_contract(
         rework_feedback=rework_feedback,
         project_profile=project_profile,
         compact=compact,
+        agent_messaging_allowed=agent_messaging_allowed,
     )
 
 
@@ -536,6 +539,7 @@ def compact_contract_json(contract: RoleInvocationContract) -> str:
         "allowed_command_families": contract.command_policy.get("allowed_command_families", []),
         "project_profile": compact_profile,
         "rework_feedback": contract.rework_feedback,
+        "agent_messaging_allowed": contract.agent_messaging_allowed,
         "output_rules": [
             "Return JSON only.",
             "For edit actions, put every file change in proposed_patches as unified_diff.",

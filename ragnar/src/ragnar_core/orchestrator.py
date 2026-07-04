@@ -6,6 +6,7 @@ import operator
 import os
 import shlex
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
@@ -14,6 +15,7 @@ from .agent_transcripts import AgentTranscriptStore, default_transcripts_path
 from .approval_store import ApprovalStore, default_approvals_path
 from .approval_broker import ApprovalBroker, Decision
 from .config import RagnarConfig, default_config_path, load_config
+from .conductor_decision import make_conductor_decision
 from .context_broker import ContextBroker, ContextBudget
 from .contracts import (
     agent_result_from_reply,
@@ -27,6 +29,7 @@ from .contracts import (
 )
 from .context_memory import ContextMemoryProvider, MemoryMode
 from .edit_adapter import SafePatchAdapter
+from .execution_profiles import profile_by_name
 from .execution import LocalExecutionAdapter
 from .memory_writeback import MemoryWritebackStore, default_writeback_path
 from .observability import RunRecorder, default_runs_path
@@ -72,6 +75,7 @@ class RagnarState(TypedDict, total=False):
     owner_briefing: str
     project_profile: dict[str, Any]
     execution_mode: str
+    conductor_decision: dict[str, Any]
 
 
 def _repo_root() -> Path:
@@ -183,6 +187,7 @@ class RagnarOrchestrator:
         graph.add_node("intake_objective", self.intake_objective)
         graph.add_node("project_profiler", self.project_profiler)
         graph.add_node("conductor_triage", self.conductor_triage)
+        graph.add_node("researcher", self.researcher)
         graph.add_node("architect_plan", self.architect_plan)
         graph.add_node("conductor_review_plan", self.conductor_review_plan)
         graph.add_node("dispatch_build_roles", self.dispatch_build_roles)
@@ -201,13 +206,34 @@ class RagnarOrchestrator:
         graph.add_conditional_edges(
             "conductor_triage",
             self.after_triage,
+            {
+                "researcher": "researcher",
+                "architect_plan": "architect_plan",
+                "dispatch_build_roles": "dispatch_build_roles",
+            },
+        )
+        graph.add_conditional_edges(
+            "researcher",
+            self.after_research,
             {"architect_plan": "architect_plan", "dispatch_build_roles": "dispatch_build_roles"},
         )
-        graph.add_edge("architect_plan", "conductor_review_plan")
+        graph.add_conditional_edges(
+            "architect_plan",
+            self.after_architect,
+            {
+                "conductor_review_plan": "conductor_review_plan",
+                "dispatch_build_roles": "dispatch_build_roles",
+                "final_report": "final_report",
+            },
+        )
         graph.add_conditional_edges(
             "conductor_review_plan",
             self.after_plan_review,
-            {"architect_plan": "architect_plan", "dispatch_build_roles": "dispatch_build_roles"},
+            {
+                "architect_plan": "architect_plan",
+                "dispatch_build_roles": "dispatch_build_roles",
+                "final_report": "final_report",
+            },
         )
         graph.add_conditional_edges(
             "dispatch_build_roles",
@@ -329,16 +355,30 @@ class RagnarOrchestrator:
     def conductor_triage(self, state: RagnarState) -> dict[str, Any]:
         conductor = self.registry.get("conductor")
         objective = state["objective"]
-        selected_roles = self._select_build_roles(objective)
-        execution_mode = (
-            "trivial_fast_path"
-            if self.config.trivial_fast_path() and self._is_trivial_objective(objective, selected_roles)
-            else "governed_crew"
-        )
+        initial_build_roles = self._select_build_roles(objective)
+        decision = make_conductor_decision(objective, initial_build_roles, state.get("project_profile"))
+        selected_roles = decision.selected_build_roles
+        if not self.config.trivial_fast_path() and decision.execution_profile == "fast_path":
+            profile = profile_by_name("standard_path")
+            decision = replace(
+                decision,
+                execution_profile="standard_path",
+                architect_required=profile.use_architect,
+                review_required=profile.use_conductor_plan_review or profile.use_conductor_qa_review == "always",
+                inter_agent_comm_required=profile.allow_inter_agent_chat and len(selected_roles) > 1,
+                reason="Fast path disabled by configuration; using standard path.",
+                budgets={
+                    "max_agent_calls": profile.max_agent_calls,
+                    "max_review_loops": profile.max_review_loops,
+                    "max_memory_hits": profile.max_memory_hits,
+                },
+            )
+        execution_mode = decision.execution_profile
         context_queries, memory_context = self.context_broker.retrieve_for_roles(objective, selected_roles)
         return {
             "phase": "triaged",
             "execution_mode": execution_mode,
+            "conductor_decision": decision.to_dict(),
             "selected_build_roles": selected_roles,
             "context_queries": context_queries,
             "memory_context": memory_context,
@@ -349,9 +389,10 @@ class RagnarOrchestrator:
                     {
                         "objective": objective,
                         "execution_mode": execution_mode,
+                        "conductor_decision": decision.to_dict(),
                         "selected_build_roles": selected_roles,
                         "role_contract": _role_summary(conductor),
-                        "routing_rule": "deterministic phrase and keyword routing with conservative backend default",
+                        "routing_rule": "deterministic conductor decision layer with complexity/risk/research profiles",
                         "memory_lookups": {
                             "queries": len(context_queries),
                             "hits": sum(len(item.get("hits", [])) for item in memory_context),
@@ -360,7 +401,16 @@ class RagnarOrchestrator:
                     },
                 )
             ],
-            "audit_events": [_event("conductor_triage", "selected build roles", roles=selected_roles)],
+            "audit_events": [
+                _event(
+                    "conductor_triage",
+                    "selected execution profile and build roles",
+                    profile=execution_mode,
+                    roles=selected_roles,
+                    research_required=decision.research_required,
+                    review_required=decision.review_required,
+                )
+            ],
         }
 
     def architect_plan(self, state: RagnarState) -> dict[str, Any]:
@@ -423,6 +473,20 @@ class RagnarOrchestrator:
             "qa_verdict": qa_body.get("verdict"),
             "qa_commands": qa_body.get("commands", []),
         }
+
+    def researcher(self, state: RagnarState) -> dict[str, Any]:
+        return self._role_execution_artifact(
+            role_id="researcher",
+            action="produce_research_brief",
+            state=state,
+            output_kind="research_brief",
+            notes=[
+                "Research only the knowledge gaps named by the conductor decision.",
+                "Return concise findings, citations or source notes when available, and implementation implications.",
+                "Do not propose code patches or outward actions.",
+                "Write durable memory only for reusable project/vendor facts, not one-off run narration.",
+            ],
+        )
 
     def backend_engineer(self, state: RagnarState) -> dict[str, Any]:
         return self._role_execution_artifact(
@@ -537,7 +601,8 @@ class RagnarOrchestrator:
         if failed_packets:
             warnings.append("One or more build role packets failed or blocked; stopping without review retries.")
 
-        if state.get("execution_mode") == "trivial_fast_path" and self.config.trivial_skip_qa_agent():
+        profile = profile_by_name(str(state.get("execution_mode")))
+        if not profile.use_qa_agent or (state.get("execution_mode") == "fast_path" and self.config.trivial_skip_qa_agent()):
             agent_result = provider_free_result(
                 state["run_id"],
                 qa,
@@ -573,7 +638,8 @@ class RagnarOrchestrator:
             memory_context=role_context
             + [{"scope": "observed_facts", "namespace": None, "query": {}, "hits": [observed_facts], "errors": []}],
             project_profile=state.get("project_profile"),
-            compact=bool(self.config.compact_letta_invocations() and state.get("execution_mode") == "trivial_fast_path"),
+            compact=bool(self.config.compact_letta_invocations()),
+            agent_messaging_allowed=bool(state.get("conductor_decision", {}).get("inter_agent_comm_required")),
         )
         if runtime_result == "pending":
             runtime_result = self.role_runtime.run(
@@ -766,11 +832,11 @@ class RagnarOrchestrator:
         }
 
     def _conductor_synthesize_briefing(self, state: RagnarState, report: dict[str, Any]) -> str:
-        if state.get("execution_mode") == "trivial_fast_path":
+        if state.get("execution_mode") in {"fast_path", "standard_path"}:
             status_line = "Awaiting your approval." if report["blocked"] else "No approvals pending."
             roles_line = ", ".join(report["selected_build_roles"]) or "no build roles"
             return (
-                f"Run {report['run_id']}: {report['phase']}. Fast path completed across "
+                f"Run {report['run_id']}: {report['phase']}. {state.get('execution_mode')} completed across "
                 f"{roles_line} with {report['artifact_count']} artifacts. {status_line}"
             )
         conductor = self.registry.get("conductor")
@@ -821,6 +887,7 @@ class RagnarOrchestrator:
                 ],
             },
             project_profile=state.get("project_profile"),
+            agent_messaging_allowed=bool(state.get("conductor_decision", {}).get("inter_agent_comm_required")),
         )
         runtime_result = self.role_runtime.run(
             conductor, state["objective"], "summarize_status", memory_context, invocation=invocation
@@ -844,17 +911,38 @@ class RagnarOrchestrator:
         )
 
     def after_triage(self, state: RagnarState) -> str:
-        if state.get("execution_mode") == "trivial_fast_path":
-            return "dispatch_build_roles"
-        return "architect_plan"
+        decision = state.get("conductor_decision", {})
+        if decision.get("research_required"):
+            return "researcher"
+        if decision.get("architect_required"):
+            return "architect_plan"
+        return "dispatch_build_roles"
+
+    def after_research(self, state: RagnarState) -> str:
+        decision = state.get("conductor_decision", {})
+        if decision.get("architect_required"):
+            return "architect_plan"
+        return "dispatch_build_roles"
+
+    def after_architect(self, state: RagnarState) -> str:
+        profile = profile_by_name(str(state.get("execution_mode")))
+        if profile.use_conductor_plan_review:
+            return "conductor_review_plan"
+        if state.get("execution_mode") == "planning_only" or not state.get("selected_build_roles", []):
+            return "final_report"
+        return "dispatch_build_roles"
 
     def after_qa_gate(self, state: RagnarState) -> str:
-        if state.get("execution_mode") == "trivial_fast_path":
-            qa_artifact = self._latest_artifact(state, "qa_verdict")
-            if qa_artifact and qa_artifact.get("body", {}).get("verdict") == "fail":
-                return "final_report"
-            return "approval_gate"
-        return "conductor_review_qa"
+        profile = profile_by_name(str(state.get("execution_mode")))
+        qa_artifact = self._latest_artifact(state, "qa_verdict")
+        verdict = qa_artifact.get("body", {}).get("verdict") if qa_artifact else None
+        if verdict == "fail":
+            if profile.use_conductor_qa_review in {"always", "on_failure"}:
+                return "conductor_review_qa"
+            return "final_report"
+        if profile.use_conductor_qa_review == "always":
+            return "conductor_review_qa"
+        return "approval_gate"
 
     def next_build_node(self, state: RagnarState) -> str:
         selected = set(state.get("selected_build_roles", []))
@@ -880,6 +968,8 @@ class RagnarOrchestrator:
     def after_plan_review(self, state: RagnarState) -> str:
         if state.get("plan_review_verdict") == "revise":
             return "architect_plan"
+        if state.get("execution_mode") == "planning_only" or not state.get("selected_build_roles", []):
+            return "final_report"
         return "dispatch_build_roles"
 
     def after_qa_review(self, state: RagnarState) -> str:
@@ -1070,7 +1160,8 @@ class RagnarOrchestrator:
             handoff_inputs=self.context_broker.handoff_inputs(state, role_id),
             rework_feedback=rework_feedback,
             project_profile=state.get("project_profile"),
-            compact=bool(self.config.compact_letta_invocations() and state.get("execution_mode") == "trivial_fast_path"),
+            compact=bool(self.config.compact_letta_invocations()),
+            agent_messaging_allowed=bool(state.get("conductor_decision", {}).get("inter_agent_comm_required")),
         )
         runtime_result = self.role_runtime.run(role, state["objective"], action, role_context, invocation=invocation)
         if runtime_result.raw_reply is not None:
@@ -1227,6 +1318,7 @@ class RagnarOrchestrator:
             memory_context=memory_context,
             expected_output_schema=expected_review_output_schema(),
             project_profile=state.get("project_profile"),
+            agent_messaging_allowed=bool(state.get("conductor_decision", {}).get("inter_agent_comm_required")),
         )
         runtime_result = self.role_runtime.run(
             conductor, state["objective"], action, memory_context, invocation=invocation

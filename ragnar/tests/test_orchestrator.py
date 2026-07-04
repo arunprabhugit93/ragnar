@@ -11,6 +11,7 @@ from typing import Any
 from ragnar_core.agent_transcripts import AgentTranscriptStore
 from ragnar_core.chat import ChatSession, render_state
 from ragnar_core.config import ModelConfig, RagnarConfig, load_config
+from ragnar_core.conductor_decision import make_conductor_decision
 from ragnar_core.context_broker import ContextBroker, ContextBudget
 from ragnar_core.contracts import MemoryWriteback, agent_result_from_reply, build_invocation_contract, provider_error_result
 from ragnar_core.edit_adapter import SafePatchAdapter, extract_changed_files
@@ -165,12 +166,30 @@ def test_trivial_frontend_task_uses_fast_path() -> None:
     artifact_kinds = [artifact["kind"] for artifact in state["artifacts"]]
     qa_artifact = next(artifact for artifact in state["artifacts"] if artifact["kind"] == "qa_verdict")
 
-    assert state["execution_mode"] == "trivial_fast_path"
+    assert state["execution_mode"] == "fast_path"
     assert artifact_kinds == ["project_profile", "conductor_triage", "frontend_work_packet", "qa_verdict"]
     assert qa_artifact["body"]["agent_transcript_summary"] is None
     assert "conductor_plan_review" not in artifact_kinds
     assert "conductor_qa_review" not in artifact_kinds
     assert "integration_packet" not in artifact_kinds
+
+
+def test_conductor_decision_profiles_by_complexity() -> None:
+    fast = make_conductor_decision("create a simple hello world html page", ["frontend_engineer"], {"languages": ["python"]})
+    research = make_conductor_decision("research latest Stripe checkout docs and integrate payment", ["backend_engineer"], {"languages": ["python"]})
+    governed = make_conductor_decision("add OAuth login with backend API and frontend page", ["backend_engineer", "frontend_engineer"], {"languages": ["python"]})
+    planning = make_conductor_decision("design the architecture for a monitoring platform", ["backend_engineer"], {"languages": ["python"]})
+
+    assert fast.execution_profile == "fast_path"
+    assert fast.research_required is False
+    assert research.execution_profile == "research_first"
+    assert research.research_required is True
+    assert "researcher" in research.selected_roles
+    assert governed.execution_profile == "governed_path"
+    assert governed.review_required is True
+    assert governed.inter_agent_comm_required is True
+    assert planning.execution_profile == "planning_only"
+    assert planning.selected_build_roles == []
 
 
 def test_trivial_fast_path_stops_on_role_failure() -> None:
@@ -204,11 +223,61 @@ def test_trivial_fast_path_stops_on_role_failure() -> None:
     state = orchestrator.invoke("create a simple hello world html page")
     qa_artifact = next(artifact for artifact in state["artifacts"] if artifact["kind"] == "qa_verdict")
 
-    assert state["execution_mode"] == "trivial_fast_path"
+    assert state["execution_mode"] == "fast_path"
     assert state["phase"] == "qa_failed"
     assert qa_artifact["body"]["verdict"] == "fail"
     assert qa_artifact["body"]["failed_packets"][0]["status"] == "failed"
     assert "conductor_qa_review" not in [artifact["kind"] for artifact in state["artifacts"]]
+
+
+def test_research_objective_spawns_researcher_before_architect() -> None:
+    state = run_objective(
+        "research latest Stripe checkout docs and integrate payment API",
+        checkpoint_db=None,
+        memory_mode="off",
+        prepare_worktrees=False,
+        record_runs=False,
+    )
+    artifact_kinds = [artifact["kind"] for artifact in state["artifacts"]]
+
+    assert state["execution_mode"] == "research_first"
+    assert state["conductor_decision"]["research_required"] is True
+    assert "research_brief" in artifact_kinds
+    assert artifact_kinds.index("research_brief") < artifact_kinds.index("architecture_plan")
+
+
+def test_standard_path_skips_architect_and_conductor_reviews_by_default() -> None:
+    state = run_objective(
+        "update backend service logging",
+        checkpoint_db=None,
+        memory_mode="off",
+        prepare_worktrees=False,
+        record_runs=False,
+    )
+    artifact_kinds = [artifact["kind"] for artifact in state["artifacts"]]
+
+    assert state["execution_mode"] == "standard_path"
+    assert "backend_work_packet" in artifact_kinds
+    assert "architecture_plan" not in artifact_kinds
+    assert "conductor_plan_review" not in artifact_kinds
+    assert "conductor_qa_review" not in artifact_kinds
+
+
+def test_planning_only_uses_architect_and_finishes_without_build_roles() -> None:
+    state = run_objective(
+        "design the architecture for a monitoring platform",
+        checkpoint_db=None,
+        memory_mode="off",
+        prepare_worktrees=False,
+        record_runs=False,
+    )
+    artifact_kinds = [artifact["kind"] for artifact in state["artifacts"]]
+
+    assert state["execution_mode"] == "planning_only"
+    assert state["selected_build_roles"] == []
+    assert "architecture_plan" in artifact_kinds
+    assert "backend_work_packet" not in artifact_kinds
+    assert "qa_verdict" not in artifact_kinds
 
 
 def test_context_broker_bounds_memory_hits_and_chars(tmp_path: Path) -> None:
@@ -750,7 +819,7 @@ def test_call_agent_sets_max_steps_and_peer_block_when_enabled() -> None:
     )
     runtime._client = fake_client
 
-    invocation = _build_test_invocation("backend_engineer")
+    invocation = replace(_build_test_invocation("backend_engineer"), agent_messaging_allowed=True)
     raw_reply, transcript = runtime._call_agent("agent-under-test", invocation)
 
     call_kwargs = fake_client.agents.messages.calls[0]
@@ -781,6 +850,24 @@ def test_call_agent_omits_peer_block_when_disabled() -> None:
     call_kwargs = fake_client.agents.messages.calls[0]
     assert call_kwargs["max_steps"] == 12
     prompt_content = call_kwargs["messages"][0]["content"]
+    assert "send_message_to_agents_matching_tags" not in prompt_content
+
+
+def test_call_agent_omits_peer_block_when_profile_disallows() -> None:
+    reply_json = '{"status":"completed","summary":"ok","proposed_patches":[],"handoffs":[],"memory_writebacks":[],"proposed_actions":[]}'
+    fake_client = _FakeLettaClient(_FakeResponse([_FakeAssistantMessage(reply_json)]))
+    runtime = RoleRuntime(
+        Path("ragnar/.ragnar/letta_agents.json"),
+        mode="letta",
+        enable_agent_messaging=True,
+        agent_max_steps=12,
+    )
+    runtime._client = fake_client
+
+    invocation = _build_test_invocation("backend_engineer")
+    runtime._call_agent("agent-under-test", invocation)
+
+    prompt_content = fake_client.agents.messages.calls[0]["messages"][0]["content"]
     assert "send_message_to_agents_matching_tags" not in prompt_content
 
 
