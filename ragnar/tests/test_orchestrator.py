@@ -25,7 +25,7 @@ from ragnar_core.letta_provisioner import (
 )
 from ragnar_core.execution import CommandResult
 from ragnar_core.memory_writeback import MemoryWritebackStore
-from ragnar_core.orchestrator import MAX_PLAN_REVISIONS, RagnarOrchestrator, run_objective
+from ragnar_core.orchestrator import MAX_PLAN_REVISIONS, MAX_QA_REVISIONS, RagnarOrchestrator, run_objective
 from ragnar_core.pr_adapter import build_pr_draft
 from ragnar_core.project_profiler import build_project_profile, qa_commands_from_profile
 from ragnar_core.role_registry import load_role_registry
@@ -246,6 +246,82 @@ def test_trivial_fast_path_stops_on_role_failure() -> None:
     assert qa_artifact["body"]["verdict"] == "fail"
     assert qa_artifact["body"]["failed_packets"][0]["status"] == "failed"
     assert "conductor_qa_review" not in [artifact["kind"] for artifact in state["artifacts"]]
+
+
+_BAD_FRONTEND_PATCH = (
+    "--- a/components/Widget.tsx\n"
+    "+++ b/components/Widget.tsx\n"
+    "@@ -1,1 +1,1 @@\n"
+    "-old\n"
+    "+new\n"
+)
+
+
+def test_patch_apply_failure_forces_rework_on_fast_path_then_escalation_blocks_at_approval_gate() -> None:
+    """A role that claims status=completed but whose diff never actually applied
+    (git apply failure on a file that doesn't exist) must not be trusted -- and
+    fast_path's profile.use_conductor_qa_review == "never" must not let it skip
+    review. After the retry cap is exhausted, escalation must actually block at
+    approval_gate instead of silently completing (request_approval used to be
+    an ALLOW action, so it previously no-op'd)."""
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    orchestrator = RagnarOrchestrator(
+        registry,
+        config_path=Path("ragnar/ragnar.yaml"),
+        prepare_worktrees=True,
+        record_runs=False,
+    )
+    orchestrator.role_runtime = _ScriptedRoleRuntime(
+        {
+            ("frontend_engineer", "edit_frontend_worktree"): [
+                json.dumps(
+                    {
+                        "run_id": "run-test",
+                        "role_id": "frontend_engineer",
+                        "status": "completed",
+                        "summary": "Updated the widget component.",
+                        "proposed_patches": [
+                            {"patch_id": "p1", "summary": "bad patch", "unified_diff": _BAD_FRONTEND_PATCH}
+                        ],
+                        "handoffs": [],
+                        "memory_writebacks": [],
+                        "proposed_actions": [],
+                    }
+                )
+            ],
+            ("conductor", "review_qa_verdict"): [
+                '{"verdict":"approve","feedback":"looked fine to me","rework_roles":[]}',
+            ],
+        }
+    )
+
+    state = orchestrator.invoke("create a simple hello world html page in this repo")
+
+    assert state["execution_mode"] == "fast_path"
+    frontend_packets = [a for a in state["artifacts"] if a["kind"] == "frontend_work_packet"]
+    assert len(frontend_packets) > 1
+    assert all(packet["body"]["patch_apply_failed"] for packet in frontend_packets)
+
+    qa_verdicts = [a for a in state["artifacts"] if a["kind"] == "qa_verdict"]
+    assert qa_verdicts[0]["body"]["verdict"] == "fail"
+    assert qa_verdicts[0]["body"]["failed_packets"][0]["patch_apply_failed"] is True
+
+    # fast_path normally never runs conductor_review_qa at all -- the
+    # patch-apply-failure override must force it to anyway.
+    qa_reviews = [a for a in state["artifacts"] if a["kind"] == "conductor_qa_review"]
+    assert qa_reviews
+    assert qa_reviews[0]["body"]["verdict"] == "revise"
+    assert "frontend_engineer" in qa_reviews[0]["body"]["rework_roles"]
+
+    expected_cap = orchestrator.config.max_qa_revisions(default=MAX_QA_REVISIONS)
+    assert state["qa_revision_count"] == expected_cap
+    assert state["qa_review_verdict"] == "escalated_to_owner"
+    assert state["phase"] == "awaiting_owner_approval"
+    assert state["blocked"] is True
+    assert any(
+        request["role_id"] == "conductor" and request["action"] == "request_approval"
+        for request in state["approval_requests"]
+    )
 
 
 def test_ambiguous_file_creation_pauses_for_clarification() -> None:

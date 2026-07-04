@@ -688,6 +688,10 @@ class RagnarOrchestrator:
             artifact
             for artifact in build_packets
             if (artifact.get("body", {}).get("agent_result", {}) or {}).get("status") in {"failed", "blocked"}
+            # Ground truth over claimed status: a role can say status="completed" while
+            # its unified diff never actually applied (git apply --check failure). QA
+            # must not let that silently pass as if the work landed.
+            or artifact.get("body", {}).get("patch_apply_failed")
         ]
         failed_packet_facts = [
             {
@@ -695,6 +699,7 @@ class RagnarOrchestrator:
                 "owner_role": artifact.get("owner_role"),
                 "status": (artifact.get("body", {}).get("agent_result", {}) or {}).get("status"),
                 "summary": (artifact.get("body", {}).get("agent_result", {}) or {}).get("summary"),
+                "patch_apply_failed": bool(artifact.get("body", {}).get("patch_apply_failed")),
             }
             for artifact in failed_packets
         ]
@@ -808,6 +813,14 @@ class RagnarOrchestrator:
 
     def conductor_review_qa(self, state: RagnarState) -> dict[str, Any]:
         qa_artifact = self._latest_artifact(state, "qa_verdict")
+        qa_body = qa_artifact.get("body", {}) if qa_artifact else {}
+        # Ground truth wins over the conductor's own judgment: a role whose patch never
+        # applied cannot be waved through as "approve" just because the model said so.
+        patch_failed_roles = [
+            str(packet.get("owner_role"))
+            for packet in qa_body.get("failed_packets", [])
+            if packet.get("patch_apply_failed") and packet.get("owner_role") in BUILD_ROLE_SET
+        ]
         result = self._conductor_review(
             review_kind="qa_review",
             action="review_qa_verdict",
@@ -823,6 +836,7 @@ class RagnarOrchestrator:
                 "workflow_engineer) when you know which one needs rework; leave it empty only if "
                 "the whole build phase needs to be redone.",
             ],
+            force_revise_roles=patch_failed_roles,
         )
         rework_roles = result["rework_roles"]
         if result["verdict"] == "revise" and not rework_roles:
@@ -1053,9 +1067,14 @@ class RagnarOrchestrator:
     def after_qa_gate(self, state: RagnarState) -> str:
         profile = profile_by_name(str(state.get("execution_mode")))
         qa_artifact = self._latest_artifact(state, "qa_verdict")
-        verdict = qa_artifact.get("body", {}).get("verdict") if qa_artifact else None
+        body = qa_artifact.get("body", {}) if qa_artifact else {}
+        verdict = body.get("verdict")
+        patch_apply_failed = any(packet.get("patch_apply_failed") for packet in body.get("failed_packets", []))
         if verdict == "fail":
-            if profile.use_conductor_qa_review in {"always", "on_failure"}:
+            # A patch that silently failed to apply is a correctness bug, not a
+            # judgment call -- it must always loop back for rework, even on
+            # profiles (fast_path) that otherwise skip conductor QA review entirely.
+            if patch_apply_failed or profile.use_conductor_qa_review in {"always", "on_failure"}:
                 return "conductor_review_qa"
             return "final_report"
         if profile.use_conductor_qa_review == "always":
@@ -1316,6 +1335,18 @@ class RagnarOrchestrator:
                 ]
             diff_report = self.workspaces.diff(state["run_id"], role_id) if workspace_report.available else diff_report
 
+        # Deterministic ground truth, independent of what the role claimed: it proposed
+        # a patch, we had a real worktree and edits are configured to apply, but none of
+        # the proposed patches actually landed (git apply --check failure, stale diff,
+        # etc). qa_gate treats this as a failure regardless of agent_result.status.
+        patch_apply_failed = (
+            bool(agent_result.proposed_patches)
+            and workspace_report.available
+            and bool(workspace_report.worktree_path)
+            and self.config.allow_agent_edits()
+            and not any(report.get("applied") for report in patch_reports)
+        )
+
         if self.record_runs:
             self.memory_writebacks.append_many(agent_result.memory_writebacks)
 
@@ -1360,6 +1391,7 @@ class RagnarOrchestrator:
             "requested_handoff_roles": requested_handoffs,
             "memory_writebacks": [writeback.to_dict() for writeback in agent_result.memory_writebacks],
             "patch_reports": patch_reports,
+            "patch_apply_failed": patch_apply_failed,
             "rejected_actions": rejected_actions,
             "notes": notes,
         }
@@ -1408,6 +1440,7 @@ class RagnarOrchestrator:
         revision_count_key: str,
         max_revisions: int,
         review_instructions: list[str],
+        force_revise_roles: list[str] | None = None,
     ) -> dict[str, Any]:
         conductor = self.registry.get("conductor")
         decision = self.approval_broker.decide(conductor, action)
@@ -1451,6 +1484,16 @@ class RagnarOrchestrator:
                 verdict="approve",
                 feedback="Offline mode: auto-approved.",
                 rework_roles=[],
+            )
+
+        if force_revise_roles:
+            # Deterministic ground truth always wins over the conductor's own verdict --
+            # it cannot rubber-stamp "approve" when a role's patch never actually landed.
+            review = replace(
+                review,
+                verdict="revise",
+                feedback=review.feedback or "A build role's patch failed to apply; forcing rework.",
+                rework_roles=sorted(set(review.rework_roles) | set(force_revise_roles)),
             )
 
         revision_count = state.get(revision_count_key, 0)
