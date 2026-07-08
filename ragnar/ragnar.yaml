@@ -77,11 +77,12 @@ execution:
   # regardless of this flag). Set false to review patches without writing them.
   allow_agent_edits: true
   # Real Letta-native agent-to-agent messaging (send_message_to_agents_matching_tags).
-  # Off by default -- flipping this off stops the effect immediately even if an
-  # already-provisioned agent still has the tool attached, since the model is
-  # never prompted toward using it. Re-provisioning also gates tool attachment
-  # itself via ragnar-provision-letta.
-  enable_agent_messaging: false
+  # On for every role/profile -- flipping this off stops the effect immediately
+  # even if an already-provisioned agent still has the tool attached, since the
+  # model is never prompted toward using it. Re-provisioning also gates tool
+  # attachment itself via ragnar-provision-letta (run it again after flipping
+  # this so already-existing agents get the tools attached, not just new ones).
+  enable_agent_messaging: true
   # Hard cap on Letta's own internal reasoning/tool-call steps per role turn.
   # Letta's server-side default is 50; kept low here to bound cost even with
   # agent-to-agent messaging enabled.

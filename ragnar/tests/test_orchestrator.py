@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ragnar_core.agent_transcripts import AgentTranscriptStore
+from ragnar_core.approval_store import ApprovalStore
 from ragnar_core.chat import ChatSession, render_state
 from ragnar_core.config import ModelConfig, RagnarConfig, load_config
 from ragnar_core.conductor_decision import make_conductor_decision
@@ -24,7 +25,7 @@ from ragnar_core.letta_provisioner import (
 )
 from ragnar_core.execution import CommandResult
 from ragnar_core.memory_writeback import MemoryWritebackStore
-from ragnar_core.orchestrator import MAX_PLAN_REVISIONS, RagnarOrchestrator, run_objective
+from ragnar_core.orchestrator import MAX_PLAN_REVISIONS, MAX_QA_REVISIONS, RagnarOrchestrator, run_objective
 from ragnar_core.pr_adapter import build_pr_draft
 from ragnar_core.project_profiler import build_project_profile, qa_commands_from_profile
 from ragnar_core.role_registry import load_role_registry
@@ -95,10 +96,21 @@ class _FakeMemoryProvider:
         ]
 
 
-def test_orchestrator_routes_all_build_roles() -> None:
+def _approve_plan(approvals_path: Path, run_id: str) -> None:
+    """Pre-approve plan_approval_gate's start_build_phase, same as an owner
+    running `/approve <run_id> conductor start_build_phase` before a rerun."""
+    ApprovalStore(approvals_path).record(run_id, "conductor", "start_build_phase", "approved", "test pre-approval")
+
+
+def test_orchestrator_routes_all_build_roles(tmp_path: Path) -> None:
+    run_id = "test-routes-all-build-roles"
+    approvals_path = tmp_path / "approvals.jsonl"
+    _approve_plan(approvals_path, run_id)
     state = run_objective(
         "build a frontend settings page with backend API and webhook integration",
         checkpoint_db=None,
+        run_id=run_id,
+        approvals_path=approvals_path,
     )
 
     assert state["selected_build_roles"] == [
@@ -110,8 +122,11 @@ def test_orchestrator_routes_all_build_roles() -> None:
     assert state.get("approval_requests", []) == []
 
 
-def test_orchestrator_uses_backend_default_and_keeps_qa_gate() -> None:
-    state = run_objective("fix the login bug", checkpoint_db=None)
+def test_orchestrator_uses_backend_default_and_keeps_qa_gate(tmp_path: Path) -> None:
+    run_id = "test-backend-default-qa-gate"
+    approvals_path = tmp_path / "approvals.jsonl"
+    _approve_plan(approvals_path, run_id)
+    state = run_objective("fix the login bug", checkpoint_db=None, run_id=run_id, approvals_path=approvals_path)
     artifact_kinds = [artifact["kind"] for artifact in state["artifacts"]]
 
     assert state["selected_build_roles"] == ["backend_engineer"]
@@ -120,11 +135,16 @@ def test_orchestrator_uses_backend_default_and_keeps_qa_gate() -> None:
     assert state["phase"] == "approved_to_finish"
 
 
-def test_orchestrator_runs_configured_qa_command() -> None:
+def test_orchestrator_runs_configured_qa_command(tmp_path: Path) -> None:
+    run_id = "test-runs-configured-qa-command"
+    approvals_path = tmp_path / "approvals.jsonl"
+    _approve_plan(approvals_path, run_id)
     state = run_objective(
         "fix the database migration",
         checkpoint_db=None,
         qa_commands=[[sys.executable, "-m", "compileall", "-q", "src/ragnar_core"]],
+        run_id=run_id,
+        approvals_path=approvals_path,
     )
     qa_artifact = next(artifact for artifact in state["artifacts"] if artifact["kind"] == "qa_verdict")
 
@@ -193,6 +213,69 @@ def test_conductor_decision_profiles_by_complexity() -> None:
     assert planning.selected_build_roles == []
 
 
+def test_max_agent_calls_budget_scales_with_configured_revision_caps() -> None:
+    """conductor_triage must recompute max_agent_calls from the actual
+    configured max_plan_revisions/max_qa_revisions (5 each in ragnar.yaml),
+    not trust execution_profiles.py's static per-profile constants -- those
+    were pure decoration until this budget was enforced and are far too tight
+    once a revision loop is actually allowed to run (each iteration costs 2+
+    real calls, and the cap defaults to 5)."""
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    orchestrator = RagnarOrchestrator(
+        registry,
+        config_path=Path("ragnar/ragnar.yaml"),
+        prepare_worktrees=False,
+        record_runs=False,
+        memory_mode="off",
+    )
+    state: Any = {"run_id": "run-budget-check", "objective": "fix the login bug", "project_profile": {}}
+    result = orchestrator.conductor_triage(state)
+
+    assert result["execution_mode"] == "governed_path"
+    max_agent_calls = result["conductor_decision"]["budgets"]["max_agent_calls"]
+    configured_qa_loop_cost = 2 * (orchestrator.config.max_qa_revisions(default=MAX_QA_REVISIONS) + 1)
+    # The old static governed_path constant (10) could not even cover the QA
+    # revision loop alone at today's configured cap -- confirm the recomputed
+    # budget actually has room for it.
+    assert max_agent_calls >= configured_qa_loop_cost
+    assert max_agent_calls > 10
+
+
+def test_call_role_runtime_blocks_at_budget_without_invoking_the_role() -> None:
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    orchestrator = RagnarOrchestrator(
+        registry,
+        config_path=Path("ragnar/ragnar.yaml"),
+        prepare_worktrees=False,
+        record_runs=False,
+    )
+    scripted = _ScriptedRoleRuntime(
+        {("backend_engineer", "edit_backend_worktree"): ['{"status":"completed","summary":"ok","proposed_patches":[],"handoffs":[],"memory_writebacks":[],"proposed_actions":[]}']}
+    )
+    orchestrator.role_runtime = scripted
+    role = registry.get("backend_engineer")
+    state: Any = {
+        "run_id": "run-test",
+        "agent_call_count": 2,
+        "conductor_decision": {"budgets": {"max_agent_calls": 2}},
+        "execution_mode": "fast_path",
+    }
+
+    result, new_count = orchestrator._call_role_runtime(role, "objective", "edit_backend_worktree", [], state, invocation=None)
+
+    assert result.status == "budget_exhausted"
+    assert result.raw_reply is None
+    assert new_count == 2
+    assert scripted.invocations == []
+
+    # One call under budget must still go through normally.
+    state["agent_call_count"] = 1
+    result2, new_count2 = orchestrator._call_role_runtime(role, "objective", "edit_backend_worktree", [], state, invocation=None)
+    assert result2.status != "budget_exhausted"
+    assert new_count2 == 2
+    assert len(scripted.invocations) == 1
+
+
 def test_trivial_fast_path_stops_on_role_failure() -> None:
     registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
     orchestrator = RagnarOrchestrator(
@@ -229,6 +312,82 @@ def test_trivial_fast_path_stops_on_role_failure() -> None:
     assert qa_artifact["body"]["verdict"] == "fail"
     assert qa_artifact["body"]["failed_packets"][0]["status"] == "failed"
     assert "conductor_qa_review" not in [artifact["kind"] for artifact in state["artifacts"]]
+
+
+_BAD_FRONTEND_PATCH = (
+    "--- a/components/Widget.tsx\n"
+    "+++ b/components/Widget.tsx\n"
+    "@@ -1,1 +1,1 @@\n"
+    "-old\n"
+    "+new\n"
+)
+
+
+def test_patch_apply_failure_forces_rework_on_fast_path_then_escalation_blocks_at_approval_gate() -> None:
+    """A role that claims status=completed but whose diff never actually applied
+    (git apply failure on a file that doesn't exist) must not be trusted -- and
+    fast_path's profile.use_conductor_qa_review == "never" must not let it skip
+    review. After the retry cap is exhausted, escalation must actually block at
+    approval_gate instead of silently completing (request_approval used to be
+    an ALLOW action, so it previously no-op'd)."""
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    orchestrator = RagnarOrchestrator(
+        registry,
+        config_path=Path("ragnar/ragnar.yaml"),
+        prepare_worktrees=True,
+        record_runs=False,
+    )
+    orchestrator.role_runtime = _ScriptedRoleRuntime(
+        {
+            ("frontend_engineer", "edit_frontend_worktree"): [
+                json.dumps(
+                    {
+                        "run_id": "run-test",
+                        "role_id": "frontend_engineer",
+                        "status": "completed",
+                        "summary": "Updated the widget component.",
+                        "proposed_patches": [
+                            {"patch_id": "p1", "summary": "bad patch", "unified_diff": _BAD_FRONTEND_PATCH}
+                        ],
+                        "handoffs": [],
+                        "memory_writebacks": [],
+                        "proposed_actions": [],
+                    }
+                )
+            ],
+            ("conductor", "review_qa_verdict"): [
+                '{"verdict":"approve","feedback":"looked fine to me","rework_roles":[]}',
+            ],
+        }
+    )
+
+    state = orchestrator.invoke("create a simple hello world html page in this repo")
+
+    assert state["execution_mode"] == "fast_path"
+    frontend_packets = [a for a in state["artifacts"] if a["kind"] == "frontend_work_packet"]
+    assert len(frontend_packets) > 1
+    assert all(packet["body"]["patch_apply_failed"] for packet in frontend_packets)
+
+    qa_verdicts = [a for a in state["artifacts"] if a["kind"] == "qa_verdict"]
+    assert qa_verdicts[0]["body"]["verdict"] == "fail"
+    assert qa_verdicts[0]["body"]["failed_packets"][0]["patch_apply_failed"] is True
+
+    # fast_path normally never runs conductor_review_qa at all -- the
+    # patch-apply-failure override must force it to anyway.
+    qa_reviews = [a for a in state["artifacts"] if a["kind"] == "conductor_qa_review"]
+    assert qa_reviews
+    assert qa_reviews[0]["body"]["verdict"] == "revise"
+    assert "frontend_engineer" in qa_reviews[0]["body"]["rework_roles"]
+
+    expected_cap = orchestrator.config.max_qa_revisions(default=MAX_QA_REVISIONS)
+    assert state["qa_revision_count"] == expected_cap
+    assert state["qa_review_verdict"] == "escalated_to_owner"
+    assert state["phase"] == "awaiting_owner_approval"
+    assert state["blocked"] is True
+    assert any(
+        request["role_id"] == "conductor" and request["action"] == "request_approval"
+        for request in state["approval_requests"]
+    )
 
 
 def test_ambiguous_file_creation_pauses_for_clarification() -> None:
@@ -291,6 +450,53 @@ def test_standard_path_skips_architect_and_conductor_reviews_by_default() -> Non
     assert "architecture_plan" not in artifact_kinds
     assert "conductor_plan_review" not in artifact_kinds
     assert "conductor_qa_review" not in artifact_kinds
+
+
+def test_plan_approval_gate_skipped_when_no_plan_produced() -> None:
+    state = run_objective(
+        "update backend service logging",
+        checkpoint_db=None,
+        memory_mode="off",
+        prepare_worktrees=False,
+        record_runs=False,
+    )
+
+    assert state["execution_mode"] == "standard_path"
+    assert state["phase"] != "awaiting_plan_approval"
+    assert state.get("approval_requests", []) == []
+    assert "backend_work_packet" in [artifact["kind"] for artifact in state["artifacts"]]
+
+
+def test_plan_approval_gate_blocks_then_proceeds_after_owner_approval(tmp_path: Path) -> None:
+    run_id = "test-plan-approval-gate-blocks-then-proceeds"
+    objective = "fix the login bug"
+    approvals_path = tmp_path / "approvals.jsonl"
+
+    blocked_state = run_objective(objective, checkpoint_db=None, run_id=run_id, approvals_path=approvals_path)
+
+    assert blocked_state["execution_mode"] == "governed_path"
+    assert blocked_state["phase"] == "awaiting_plan_approval"
+    assert blocked_state["blocked"] is True
+    assert blocked_state["approval_requests"] == [
+        {
+            "role_id": "conductor",
+            "action": "start_build_phase",
+            "reason": blocked_state["approval_requests"][0]["reason"],
+            "requested_at": blocked_state["approval_requests"][0]["requested_at"],
+            "status": "pending_owner_approval",
+        }
+    ]
+    artifact_kinds = [artifact["kind"] for artifact in blocked_state["artifacts"]]
+    assert "architecture_plan" in artifact_kinds
+    assert "backend_work_packet" not in artifact_kinds
+
+    _approve_plan(approvals_path, run_id)
+    approved_state = run_objective(objective, checkpoint_db=None, run_id=run_id, approvals_path=approvals_path)
+
+    assert approved_state["phase"] != "awaiting_plan_approval"
+    artifact_kinds = [artifact["kind"] for artifact in approved_state["artifacts"]]
+    assert "backend_work_packet" in artifact_kinds
+    assert "qa_verdict" in artifact_kinds
 
 
 def test_planning_only_uses_architect_and_finishes_without_build_roles() -> None:
@@ -362,6 +568,52 @@ def test_context_broker_compacts_handoff_inputs(tmp_path: Path) -> None:
     ]
 
 
+def test_already_done_skips_past_skip_artifacts_to_the_real_original(tmp_path: Path) -> None:
+    """On a real multi-replay run, a role's first replay produces a skip-
+    artifact whose own agent_result carries a generic "Skipped duplicate
+    work..." placeholder summary, not the real content. A second replay's
+    already_done() lookup must not match THAT skip-artifact as if it were the
+    genuine prior completion -- doing so would return the placeholder text
+    instead of the real summary/changed_files, and each further replay would
+    degrade it again. This was caught via a real end-to-end run, not a mock."""
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    broker = ContextBroker(
+        registry,
+        _FakeMemoryProvider(),  # type: ignore[arg-type]
+        RunLedgerStore(tmp_path / "ledger.jsonl"),
+    )
+    real_artifact = {
+        "kind": "architecture_plan",
+        "owner_role": "delivery_architect",
+        "body": {
+            "allowed_action": "create_delivery_plan",
+            "agent_result": {"status": "completed", "summary": "Real delivery plan content."},
+            "diff": {"changed_files": []},
+        },
+    }
+    skip_artifact = {
+        "kind": "architecture_plan",
+        "owner_role": "delivery_architect",
+        "body": {
+            "allowed_action": "create_delivery_plan",
+            "agent_result": {
+                "status": "completed",
+                "summary": "Skipped duplicate work; prior artifact already exists: architecture_plan.",
+            },
+            "already_done": {"artifact_kind": "architecture_plan", "summary": "Real delivery plan content.", "changed_files": []},
+        },
+    }
+    state: Any = {
+        "run_id": "run-already-done-test",
+        "artifacts": [real_artifact, skip_artifact],
+    }
+
+    existing = broker.already_done(state, "delivery_architect", "create_delivery_plan")
+
+    assert existing is not None
+    assert existing["summary"] == "Real delivery plan content."
+
+
 def test_memory_writebacks_are_curated_and_deduped(tmp_path: Path) -> None:
     store = MemoryWritebackStore(tmp_path / "memory.jsonl")
     durable = MemoryWriteback(
@@ -393,13 +645,90 @@ def test_memory_writebacks_are_curated_and_deduped(tmp_path: Path) -> None:
     assert records[1]["promote"] is False
 
 
-def test_role_context_carries_prior_role_handoff_without_full_repeat() -> None:
+def test_near_duplicate_consolidation_skips_noise_but_keeps_qa_findings_and_decisions(tmp_path: Path) -> None:
+    """Near-duplicate suppression must only apply to genuinely redundant
+    restatements (project_context here), never to qa_finding or decision --
+    for QA findings, repetition is itself the signal (a role failing the same
+    way three times matters more than once), and decisions are rare/high-value
+    enough that a textual near-match is more likely a distinct decision than
+    noise. Silently dropping either would be a real quality regression."""
+    store = MemoryWritebackStore(tmp_path / "memory.jsonl")
+
+    qa_finding_1 = MemoryWriteback(
+        role_id="qa_engineer",
+        namespace="qa_findings",
+        scope="shared",
+        text="QA failed on run run-1: patch failed to apply for: backend_engineer",
+        tags=["ragnar", "qa_finding", "role:qa_engineer", "ground_truth"],
+        source_run_id="run-1",
+        source_artifact="qa_verdict",
+    )
+    qa_finding_2 = MemoryWriteback(
+        role_id="qa_engineer",
+        namespace="qa_findings",
+        scope="shared",
+        text="QA failed on run run-2: patch failed to apply for: backend_engineer",
+        tags=["ragnar", "qa_finding", "role:qa_engineer", "ground_truth"],
+        source_run_id="run-2",
+        source_artifact="qa_verdict",
+    )
+    decision_1 = MemoryWriteback(
+        role_id="conductor",
+        namespace="decisions",
+        scope="shared",
+        text="Decision: use OpenRouter for all provider calls to avoid per-vendor keys.",
+        tags=["decision"],
+        source_run_id="run-1",
+        source_artifact="conductor_plan_review",
+    )
+    decision_2 = MemoryWriteback(
+        role_id="conductor",
+        namespace="decisions",
+        scope="shared",
+        text="Decision: use OpenRouter for all provider calls to avoid per-vendor billing.",
+        tags=["decision"],
+        source_run_id="run-2",
+        source_artifact="conductor_plan_review",
+    )
+    project_context_1 = MemoryWriteback(
+        role_id="researcher",
+        namespace="project_context",
+        scope="shared",
+        text="The project uses a microservice architecture with three core services handling billing.",
+        tags=["context"],
+        source_run_id="run-1",
+        source_artifact="research_brief",
+    )
+    project_context_2 = MemoryWriteback(
+        role_id="researcher",
+        namespace="project_context",
+        scope="shared",
+        text="The project uses a microservice architecture with three core services handling billing!",
+        tags=["context"],
+        source_run_id="run-2",
+        source_artifact="research_brief",
+    )
+
+    written = store.append_many(
+        [qa_finding_1, qa_finding_2, decision_1, decision_2, project_context_1, project_context_2]
+    )
+    records = store.list()
+    classifications = [record["classification"] for record in records]
+
+    assert written == 5  # only the near-duplicate project_context entry is skipped
+    assert classifications.count("qa_finding") == 2
+    assert classifications.count("decision") == 2
+    assert classifications.count("project_context") == 1
+
+
+def test_role_context_carries_prior_role_handoff_without_full_repeat(tmp_path: Path) -> None:
     registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
     orchestrator = RagnarOrchestrator(
         registry,
         config_path=Path("ragnar/ragnar.yaml"),
         prepare_worktrees=True,
         record_runs=False,
+        approvals_path=tmp_path / "approvals.jsonl",
     )
     runtime = _ScriptedRoleRuntime(
         {
@@ -427,7 +756,9 @@ def test_role_context_carries_prior_role_handoff_without_full_repeat() -> None:
     )
     orchestrator.role_runtime = runtime
 
-    orchestrator.invoke("build backend API and frontend page")
+    run_id = "test-role-context-handoff"
+    _approve_plan(orchestrator.approval_store.path, run_id)
+    orchestrator.invoke("build backend API and frontend page", run_id=run_id)
     frontend_invocation = next(item for item in runtime.invocations if item and item.role_id == "frontend_engineer")
 
     assert frontend_invocation.handoff_inputs[0]["from_role"] == "backend_engineer"
@@ -435,11 +766,16 @@ def test_role_context_carries_prior_role_handoff_without_full_repeat() -> None:
     assert "GET /api/profile" in frontend_invocation.handoff_inputs[0]["summary"]
 
 
-def test_orchestrator_includes_agent_contract_and_writeback_format() -> None:
+def test_orchestrator_includes_agent_contract_and_writeback_format(tmp_path: Path) -> None:
+    run_id = "test-agent-contract-writeback"
+    approvals_path = tmp_path / "approvals.jsonl"
+    _approve_plan(approvals_path, run_id)
     state = run_objective(
         "fix the login bug",
         checkpoint_db=None,
         memory_mode="off",
+        run_id=run_id,
+        approvals_path=approvals_path,
     )
     packet = next(artifact for artifact in state["artifacts"] if artifact["kind"] == "backend_work_packet")
 
@@ -450,11 +786,16 @@ def test_orchestrator_includes_agent_contract_and_writeback_format() -> None:
     assert packet["body"]["memory_writebacks"][0]["scope"] == "private"
 
 
-def test_qa_rejects_disallowed_command() -> None:
+def test_qa_rejects_disallowed_command(tmp_path: Path) -> None:
+    run_id = "test-qa-rejects-disallowed-command"
+    approvals_path = tmp_path / "approvals.jsonl"
+    _approve_plan(approvals_path, run_id)
     state = run_objective(
         "fix the database migration",
         checkpoint_db=None,
         qa_commands=[[sys.executable, "-c", "print('not allowed')"]],
+        run_id=run_id,
+        approvals_path=approvals_path,
     )
     qa_artifact = next(artifact for artifact in state["artifacts"] if artifact["kind"] == "qa_verdict")
 
@@ -645,8 +986,11 @@ def test_architect_plan_produces_real_agent_artifact_shape_offline() -> None:
     assert plan_artifact["body"]["agent_result"]["status"] == "no_provider"
 
 
-def test_conductor_review_plan_defaults_to_approve_offline() -> None:
-    state = run_objective("fix the login bug", checkpoint_db=None)
+def test_conductor_review_plan_defaults_to_approve_offline(tmp_path: Path) -> None:
+    run_id = "test-conductor-review-plan-approve"
+    approvals_path = tmp_path / "approvals.jsonl"
+    _approve_plan(approvals_path, run_id)
+    state = run_objective("fix the login bug", checkpoint_db=None, run_id=run_id, approvals_path=approvals_path)
 
     assert state["plan_review_verdict"] == "approve"
     assert state["plan_revision_count"] == 0
@@ -655,8 +999,11 @@ def test_conductor_review_plan_defaults_to_approve_offline() -> None:
     assert "backend_work_packet" in artifact_kinds
 
 
-def test_conductor_review_qa_defaults_to_approve_offline() -> None:
-    state = run_objective("fix the login bug", checkpoint_db=None)
+def test_conductor_review_qa_defaults_to_approve_offline(tmp_path: Path) -> None:
+    run_id = "test-conductor-review-qa-approve"
+    approvals_path = tmp_path / "approvals.jsonl"
+    _approve_plan(approvals_path, run_id)
+    state = run_objective("fix the login bug", checkpoint_db=None, run_id=run_id, approvals_path=approvals_path)
 
     assert state["qa_review_verdict"] == "approve"
     assert state["qa_rework_roles"] == []
@@ -691,7 +1038,58 @@ def test_plan_revision_loop_respects_retry_cap() -> None:
     assert state.get("final_report")
 
 
-def test_qa_revision_loop_routes_back_to_named_role() -> None:
+def test_conductor_review_reuses_cached_verdict_when_subject_unchanged(tmp_path: Path) -> None:
+    """Simulates the plan-approval-gate replay pattern: conductor_review_plan
+    called twice for the SAME unchanged plan artifact (as happens when a run
+    blocks for owner approval and gets rerun) must not re-bill a second
+    identical LLM call -- and a genuinely changed subject must still trigger
+    a fresh one."""
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    orchestrator = RagnarOrchestrator(
+        registry,
+        config_path=Path("ragnar/ragnar.yaml"),
+        prepare_worktrees=False,
+        record_runs=True,
+    )
+    orchestrator.run_ledger = RunLedgerStore(tmp_path / "run_ledger.jsonl")
+    scripted = _ScriptedRoleRuntime(
+        {("conductor", "review_delivery_plan"): ['{"verdict":"approve","feedback":"looks fine","rework_roles":[]}']}
+    )
+    orchestrator.role_runtime = scripted
+
+    plan_artifact = {
+        "kind": "architecture_plan",
+        "owner_role": "delivery_architect",
+        "created_at": "now",
+        "body": {"agent_result": {"summary": "Do X then Y."}, "diff": {"changed_files": []}},
+    }
+    state: Any = {
+        "run_id": "run-dedup-test",
+        "objective": "fix the login bug",
+        "artifacts": [plan_artifact],
+        "plan_revision_count": 0,
+    }
+
+    result1 = orchestrator.conductor_review_plan(state)
+    assert result1["artifacts"][0]["body"].get("reused_from_ledger") is not True
+    assert len(scripted.invocations) == 1
+
+    result2 = orchestrator.conductor_review_plan(state)
+    assert result2["artifacts"][0]["body"].get("reused_from_ledger") is True
+    assert len(scripted.invocations) == 1
+    assert result2["plan_review_verdict"] == "approve"
+
+    changed_plan_artifact = {
+        **plan_artifact,
+        "body": {"agent_result": {"summary": "Do X then Y then Z."}, "diff": {"changed_files": ["a.py"]}},
+    }
+    state["artifacts"] = [changed_plan_artifact]
+    result3 = orchestrator.conductor_review_plan(state)
+    assert result3["artifacts"][0]["body"].get("reused_from_ledger") is not True
+    assert len(scripted.invocations) == 2
+
+
+def test_qa_revision_loop_routes_back_to_named_role(tmp_path: Path) -> None:
     registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
     orchestrator = RagnarOrchestrator(
         registry,
@@ -699,6 +1097,7 @@ def test_qa_revision_loop_routes_back_to_named_role() -> None:
         prepare_worktrees=False,
         record_runs=False,
         qa_commands=[[sys.executable, "-m", "pytest", "-q", "/nonexistent-test-file-xyz.py"]],
+        approvals_path=tmp_path / "approvals.jsonl",
     )
     orchestrator.role_runtime = _ScriptedRoleRuntime(
         {
@@ -709,7 +1108,9 @@ def test_qa_revision_loop_routes_back_to_named_role() -> None:
         }
     )
 
-    state = orchestrator.invoke("fix the login bug")
+    run_id = "test-qa-revision-loop"
+    _approve_plan(orchestrator.approval_store.path, run_id)
+    state = orchestrator.invoke("fix the login bug", run_id=run_id)
 
     backend_packets = [a for a in state["artifacts"] if a["kind"] == "backend_work_packet"]
     assert len(backend_packets) == 2
@@ -719,13 +1120,14 @@ def test_qa_revision_loop_routes_back_to_named_role() -> None:
     assert state["qa_review_verdict"] == "approve"
 
 
-def test_blocked_build_role_handoff_routes_next_build_role() -> None:
+def test_blocked_build_role_handoff_routes_next_build_role(tmp_path: Path) -> None:
     registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
     orchestrator = RagnarOrchestrator(
         registry,
         config_path=Path("ragnar/ragnar.yaml"),
         prepare_worktrees=False,
         record_runs=False,
+        approvals_path=tmp_path / "approvals.jsonl",
     )
     orchestrator.role_runtime = _ScriptedRoleRuntime(
         {
@@ -746,7 +1148,9 @@ def test_blocked_build_role_handoff_routes_next_build_role() -> None:
         }
     )
 
-    state = orchestrator.invoke("fix login and then create the page")
+    run_id = "test-blocked-build-role-handoff"
+    _approve_plan(orchestrator.approval_store.path, run_id)
+    state = orchestrator.invoke("fix login and then create the page", run_id=run_id)
     artifact_kinds = [artifact["kind"] for artifact in state["artifacts"]]
     backend_packet = next(artifact for artifact in state["artifacts"] if artifact["kind"] == "backend_work_packet")
 
@@ -932,6 +1336,36 @@ def test_call_agent_uses_compact_contract_when_requested() -> None:
     assert '"allowed_path_globs"' in prompt_content
     assert '"role_contract"' not in prompt_content
     assert '"expected_output_schema"' not in prompt_content
+    # compact must still carry retrieval results the role needs to act on --
+    # only the redundant role_contract/full schema get dropped, not these.
+    assert '"memory_context"' in prompt_content
+    assert '"handoff_inputs"' in prompt_content
+
+
+def test_compact_contract_carries_actual_memory_and_handoff_content() -> None:
+    fake_client = _FakeLettaClient(_FakeResponse([_FakeAssistantMessage('{"status":"completed","summary":"ok","proposed_patches":[],"handoffs":[],"memory_writebacks":[],"proposed_actions":[]}')]))
+    runtime = RoleRuntime(Path("ragnar/.ragnar/letta_agents.json"), mode="letta")
+    runtime._client = fake_client
+
+    registry = load_role_registry(Path("ragnar/roles/ragnar_roles.yaml"))
+    role = registry.get("frontend_engineer")
+    invocation = build_invocation_contract(
+        run_id="run-test",
+        objective="test objective",
+        action="edit_frontend_worktree",
+        role=role,
+        model=ModelConfig(provider="openrouter", model="openrouter/x/y", temperature=0.1, max_tokens=100),
+        workspace={"available": False},
+        policy=None,
+        memory_context=[{"scope": "private", "namespace": role.private_memory_namespace, "query": {}, "hits": [{"text": "PGVECTOR_MARKER_TEXT"}], "errors": []}],
+        handoff_inputs=[{"from_role": "backend_engineer", "summary": "HANDOFF_MARKER_TEXT", "changed_files": [], "patch_count": 0}],
+        compact=True,
+    )
+    runtime._call_agent("agent-under-test", invocation)
+
+    prompt_content = fake_client.agents.messages.calls[0]["messages"][0]["content"]
+    assert "PGVECTOR_MARKER_TEXT" in prompt_content
+    assert "HANDOFF_MARKER_TEXT" in prompt_content
 
 
 def test_agent_transcript_store_appends_and_filters_by_run_id(tmp_path: Path) -> None:
@@ -1261,7 +1695,11 @@ def test_qa_gate_does_not_run_commands_from_profile_when_discovery_disabled() ->
     qa_artifact = result["artifacts"][0]
     assert qa_artifact["body"]["verdict"] == "pass_with_warnings"
     assert qa_artifact["body"]["agent_invocation"]["workspace"]["status"] == "reviewing_build_worktrees"
-    assert qa_artifact["body"]["agent_invocation"]["workspace"]["reviewed_worktrees"][0]["role_id"] == "backend_engineer"
+    # reviewed_worktrees lives only in the observed_facts memory_context entry now,
+    # not duplicated into workspace too -- see qa_gate's comment on why.
+    observed_facts = qa_artifact["body"]["agent_invocation"]["memory_context"][-1]["hits"][0]
+    assert observed_facts["reviewed_worktrees"][0]["role_id"] == "backend_engineer"
+    assert "reviewed_worktrees" not in qa_artifact["body"]["agent_invocation"]["workspace"]
 
 
 def test_qa_gate_discovers_and_runs_command_from_project_profile() -> None:

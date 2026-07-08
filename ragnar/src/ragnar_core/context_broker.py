@@ -108,6 +108,13 @@ class ContextBroker:
     def already_done(self, state: dict[str, Any], role_id: str, action: str) -> dict[str, Any] | None:
         for artifact in reversed(state.get("artifacts", [])):
             body = artifact.get("body", {})
+            # A skip-artifact's own agent_result.status is hardcoded to "completed" with a
+            # generic "Skipped duplicate work..." summary -- matching it here instead of
+            # continuing past it to the real original would degrade the returned summary
+            # on every subsequent replay (each skip's placeholder text becomes the next
+            # lookup's "original", losing the actual content a few replays in).
+            if body.get("already_done") is not None:
+                continue
             result = body.get("agent_result", {}) or {}
             if artifact.get("owner_role") != role_id or body.get("allowed_action") != action:
                 continue
@@ -145,4 +152,16 @@ class ContextBroker:
         for record in records:
             if record.get("role_id") == role.role_id or record.get("role_id") in receives_from:
                 relevant.append(record)
-        return relevant[-self.budget.max_handoffs :]
+        # Bounded by count already (max_handoffs); also bound text length the same
+        # way _bound_lookups does for memory-provider hits -- a run_ledger summary
+        # can be up to 1000 chars (record_from_artifact's own cap) and was riding
+        # along uncapped here. Fingerprint is a 64-char hash with no value to a
+        # role's reasoning, so it's dropped rather than trimmed.
+        return [
+            {
+                key: (str(value)[: self.budget.max_hit_chars] if key == "summary" else value)
+                for key, value in record.items()
+                if key != "fingerprint"
+            }
+            for record in relevant[-self.budget.max_handoffs :]
+        ]

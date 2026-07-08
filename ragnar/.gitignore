@@ -1,0 +1,18 @@
+# Local runtime state written by RagnarOrchestrator -- letta_agents.json is the
+# only .ragnar/ file meant to be tracked (the provisioning manifest); everything
+# else here is per-machine run history/logs/checkpoints that should never be
+# committed.
+.ragnar/run_ledger.jsonl
+.ragnar/approvals.jsonl
+.ragnar/memory_writebacks.jsonl
+.ragnar/agent_transcripts.jsonl
+.ragnar/orchestrator.sqlite
+.ragnar/runs/
+.ragnar/pr_drafts/
+.ragnar/worktrees/
+
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
